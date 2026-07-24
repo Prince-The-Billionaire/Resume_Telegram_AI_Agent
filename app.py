@@ -2,21 +2,37 @@ import os
 import json
 import io
 import logging
+import asyncio
+import itertools
 from typing import Dict, List, Optional
 import modal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+# ==================== MODAL ENVIRONMENT SETUP ====================
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("google-genai", "pypdf", "weasyprint", "pydantic", "requests", "beautifulsoup4", "supabase", "fastapi[standard]")
+    .pip_install(
+        "google-genai", 
+        "pypdf", 
+        "weasyprint", 
+        "pydantic", 
+        "requests", 
+        "beautifulsoup4", 
+        "supabase", 
+        "fastapi[standard]",
+        "playwright",
+        "httpx"
+    )
+    .run_commands("playwright install chromium", "playwright install-deps chromium")
     .apt_install("fonts-dejavu", "fonts-liberation", "fontconfig", "libglib2.0-0", "libcairo2", "libpango-1.0-0", "libpangocairo-1.0-0")
 )
 
 app = modal.App("ats-resume-bot", image=image)
 
+# ==================== SCHEMAS ====================
 class PersonalInfo(BaseModel):
     name: str
     email: str
@@ -43,6 +59,7 @@ class JobEntry(BaseModel):
 
 class ProjectEntry(BaseModel):
     title: str
+    link: Optional[str] = None
     achievements: List[str]
 
 class InterestCategory(BaseModel):
@@ -71,6 +88,39 @@ class AnalyticsReport(BaseModel):
     actionable_improvements: List[str]
     go_no_go_recommendation: str
 
+class GitHubProjectInfo(BaseModel):
+    title: str
+    description: str
+    live_link: Optional[str] = None
+    achievements: List[str]
+
+class GitHubAnalysisResult(BaseModel):
+    top_projects: List[GitHubProjectInfo]
+
+# ==================== CSS TEMPLATE ====================
+ENHANCED_RESUME_CSS = """
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+  :root { --primary-color: #0f172a; --accent-color: #2563eb; --text-dark: #1e293b; --text-muted: #64748b; --border-color: #e2e8f0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; color: var(--text-dark); background-color: #ffffff; line-height: 1.6; padding: 2rem; max-width: 850px; margin: 0 auto; }
+  header { border-bottom: 2px solid var(--border-color); padding-bottom: 1.5rem; margin-bottom: 2rem; text-align: center; }
+  header h1 { font-size: 2.25rem; font-weight: 700; color: var(--primary-color); letter-spacing: -0.025em; }
+  .contact-info { display: flex; justify-content: center; flex-wrap: wrap; gap: 1rem; margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-muted); }
+  section { margin-bottom: 1.5rem; }
+  section h2 { font-size: 1.15rem; font-weight: 600; color: var(--primary-color); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border-color); padding-bottom: 0.25rem; margin-bottom: 1rem; }
+  .item { margin-bottom: 1.25rem; }
+  .item-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.25rem; }
+  .item-title { font-size: 1.05rem; font-weight: 600; color: var(--primary-color); }
+  .item-subtitle { color: var(--accent-color); font-weight: 500; }
+  .item-date { font-size: 0.85rem; color: var(--text-muted); font-weight: 400; }
+  ul.bullet-points { list-style-type: disc; margin-left: 1.25rem; margin-top: 0.25rem; }
+  ul.bullet-points li { margin-bottom: 0.25rem; font-size: 0.95rem; color: #334155; }
+  .skills-container { margin-bottom: 0.5rem; font-size: 0.95rem; }
+</style>
+"""
+
+# ==================== SERVICES ====================
 class GeminiService:
     def __init__(self):
         from google import genai
@@ -81,8 +131,7 @@ class GeminiService:
 
     def _structured(self, prompt: str, schema, temp=0.2):
         resp = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
+            model=self.model, contents=prompt,
             config=self.types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=temp)
         )
         return schema.model_validate_json(resp.text)
@@ -91,15 +140,20 @@ class GeminiService:
         prompt = f"Parse this raw text resume directly into the structured Harvard schema structure. Reorganize all profile handles into absolute https:// links:\n\n{raw_text}"
         return self._structured(prompt, HarvardResume, 0.1)
 
+    def select_top_github_projects(self, repos_data: List[dict]) -> GitHubAnalysisResult:
+        prompt = f"Analyze these GitHub repositories. Extract the top 3 strongest projects based on code complexity and relevance. Create strong bullet point achievements for each.\nRepos:\n{json.dumps(repos_data, indent=2)}"
+        return self._structured(prompt, GitHubAnalysisResult, 0.2)
+
     def gap_interview(self, master: HarvardResume, job_description: str) -> TechnicalGapInterrogator:
         prompt = f"Compare this candidate's profile to the target job description. Identify up to 3 core hard technical components or metrics missing.\nResume:\n{master.model_dump_json()}\nJob Description:\n{job_description}"
         return self._structured(prompt, TechnicalGapInterrogator, 0.2)
 
-    def tailor_resume(self, master: HarvardResume, job_description: str, interview_qa: str) -> HarvardResume:
+    def tailor_resume(self, master: HarvardResume, job_description: str, interview_qa: str, github_projects: List[ProjectEntry]) -> HarvardResume:
         prompt = f"""You are an expert career agent formatting a resume to the Harvard standard.
-TAILORING & INLINE BLENDING RULES: Do NOT delete existing jobs. Blend answers. Use <b> tags for metrics.
+TAILORING RULES: Do NOT delete existing jobs. Blend answers seamlessly. Add the synthesized GitHub projects into the key_projects section to boost technical density.
 Master Profile:\n{master.model_dump_json()}
-Target Job Description:\n{job_description}\nCandidate's Answers:\n{interview_qa}"""
+GitHub Projects to Inject:\n{json.dumps([p.model_dump() for p in github_projects], indent=2)}
+Job Description:\n{job_description}\nCandidate's Answers:\n{interview_qa}"""
         return self._structured(prompt, HarvardResume, 0.2)
 
     def ats_fix(self, tailored: HarvardResume, recommendations: List[str]) -> HarvardResume:
@@ -110,16 +164,6 @@ Target Job Description:\n{job_description}\nCandidate's Answers:\n{interview_qa}
         prompt = f"You are an elite corporate recruiter. Critique this tailored resume.\nResume: {tailored.model_dump_json()}\nJob: {job_description}"
         return self._structured(prompt, AnalyticsReport, 0.2)
 
-    def cover_letter(self, master: HarvardResume, job_description: str) -> str:
-        prompt = f"Write a concise professional cover letter.\nCandidate: {master.model_dump_json()}\nJob: {job_description}"
-        resp = self.client.models.generate_content(model=self.model, contents=prompt)
-        return resp.text
-
-    def analyze_github(self, github_url: str) -> str:
-        prompt = f"Analyze this GitHub profile and suggest 2-3 strong projects with bullet points suitable for resume: {github_url}"
-        resp = self.client.models.generate_content(model=self.model, contents=prompt)
-        return resp.text
-
 class StorageService:
     def __init__(self):
         from supabase import create_client
@@ -127,13 +171,12 @@ class StorageService:
 
     def get_or_create_profile(self, chat_id: int) -> dict:
         res = self.client.table("profiles").select("*").eq("chat_id", chat_id).execute()
-        if res.data:
-            return res.data[0]
+        if res.data: return res.data[0]
         new_profile = {
             "chat_id": chat_id, "master_resume": {}, "current_state": "IDLE",
             "job_desc": "", "questions": [], "current_q_idx": 0, "qa_responses": "",
             "last_tailored": {}, "last_recommendations": [], "target_role": "", "target_location": "",
-            "linkedin": "", "github": ""
+            "linkedin": "", "github": "", "github_projects": []
         }
         self.client.table("profiles").insert(new_profile).execute()
         return new_profile
@@ -142,303 +185,346 @@ class StorageService:
         self.client.table("profiles").update(updates).eq("chat_id", chat_id).execute()
 
 class ScraperService:
-    def fetch_job_listings(self, role: str, location: str) -> List[Dict]:
+    def scrape_github_repos(self, github_url: str) -> List[dict]:
+        import requests
+        username = github_url.rstrip('/').split('/')[-1]
+        api_url = f"https://api.github.com/users/{username}/repos?sort=updated&per_page=10"
+        repos_data = []
+        try:
+            resp = requests.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if resp.status_code == 200:
+                for r in resp.json():
+                    if r.get("fork"): continue
+                    repos_data.append({
+                        "name": r.get("name"),
+                        "description": r.get("description") or "No description",
+                        "homepage": r.get("homepage") or "",
+                        "language": r.get("language") or "Code"
+                    })
+        except Exception as e:
+            logger.error(f"GitHub Scraper Error: {e}")
+        return repos_data
+
+    async def fetch_job_listings_async(self, role: str, location: str) -> List[Dict]:
+        from playwright.async_api import async_playwright
         results = []
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         try:
-            import requests
-            from bs4 import BeautifulSoup
-            url = f"https://www.jobberman.com/jobs?q={role.replace(' ', '+')}&l={location.replace(' ', '+')}"
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for a in soup.find_all('a', href=True):
-                    if '/job/' in a['href'] and len(a.text.strip()) > 5:
-                        results.append({
-                            "title": a.text.strip()[:60],
-                            "company": "Jobberman",
-                            "location": location,
-                            "platform": "Jobberman",
-                            "link": a['href'] if a['href'].startswith('http') else f"https://www.jobberman.com{a['href']}"
-                        })
-                    if len(results) >= 4: break
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                
+                # 1. LinkedIn
+                try:
+                    await page.goto(f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}", timeout=15000)
+                    cards = await page.query_selector_all("div.base-search-card")
+                    for card in cards[:3]:
+                        title = await (await card.query_selector(".base-search-card__title")).inner_text()
+                        link = await (await card.query_selector("a.base-card__full-link")).get_attribute("href")
+                        results.append({"title": title.strip(), "platform": "LinkedIn", "link": link.split('?')[0]})
+                except Exception: pass
+
+                # 2. RemoteOK
+                try:
+                    await page.goto(f"https://remoteok.com/remote-{role.lower().replace(' ', '-')}-jobs", timeout=10000)
+                    jobs = await page.query_selector_all("tr.job")
+                    for job in jobs[:2]:
+                        title = await (await job.query_selector("h2")).inner_text()
+                        link = await job.get_attribute("data-url")
+                        results.append({"title": title.strip(), "platform": "RemoteOK", "link": f"https://remoteok.com{link}"})
+                except Exception: pass
+
+                # 3. Jobberman
+                try:
+                    await page.goto(f"https://www.jobberman.com/jobs?q={role.replace(' ', '+')}&l={location.replace(' ', '+')}", timeout=10000)
+                    links = await page.query_selector_all("a[href*='/job/']")
+                    for a in links[:2]:
+                        text = await a.inner_text()
+                        href = await a.get_attribute("href")
+                        if len(text.strip()) > 5:
+                            results.append({"title": text.strip()[:60], "platform": "Jobberman", "link": href})
+                except Exception: pass
+
+                await browser.close()
         except Exception as e:
-            logger.warning(f"Jobberman error: {e}")
-        try:
-            url = f"https://remoteok.com/remote-{role.lower().replace(' ', '-')}-jobs"
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for job in soup.select('tr.job')[:5]:
-                    title = job.select_one('h2')
-                    if title:
-                        results.append({
-                            "title": title.get_text(strip=True)[:60],
-                            "company": "RemoteOK",
-                            "location": "Remote",
-                            "platform": "RemoteOK",
-                            "link": "https://remoteok.com" + (job.get('data-url') or '')
-                        })
-        except Exception as e:
-            logger.warning(f"RemoteOK error: {e}")
-        results.append({"title": f"Senior {role.title()}", "company": "LinkedIn", "location": location, "platform": "LinkedIn", "link": f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}"})
+            logger.error(f"Playwright Jobs error: {e}")
         return results
 
-    def extract_job_description(self, url: str) -> str:
+    async def extract_job_description_async(self, url: str) -> str:
+        from playwright.async_api import async_playwright
         try:
-            import requests
-            from bs4 import BeautifulSoup
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                for script in soup(["script", "style", "nav", "footer"]):
-                    script.decompose()
-                text = soup.get_text(separator=' ')
-                return ' '.join(text.split())[:4000]
-        except Exception:
-            pass
-        return f"Target role context from: {url}"
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(url, timeout=20000)
+                await page.evaluate("() => document.querySelectorAll('script, style, nav, footer').forEach(el => el.remove())")
+                text = await page.inner_text("body")
+                await browser.close()
+                clean = ' '.join(text.split())
+                return clean[:4000] if len(clean) > 100 else f"Fallback Context from: {url}"
+        except Exception as e:
+            return f"Context extraction failed. Role URL: {url}"
 
-def send_tg_message(chat_id: int, text: str):
+# ==================== TELEGRAM HELPERS ====================
+def tg_api(method: str, payload: dict = None, files: dict = None):
     import requests
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+    url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}"
+    resp = requests.post(url, json=payload if not files else None, data=payload if files else None, files=files)
+    return resp.json()
 
-def send_tg_document(chat_id: int, file_path: str, caption: str):
-    import requests
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+def send_message(chat_id: int, text: str) -> int:
+    res = tg_api("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+    return res.get("result", {}).get("message_id")
+
+def edit_message(chat_id: int, msg_id: int, text: str):
+    tg_api("editMessageText", {"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "Markdown"})
+
+def send_doc(chat_id: int, file_path: str, caption: str):
     with open(file_path, "rb") as f:
-        requests.post(f"https://api.telegram.org/bot{token}/sendDocument", data={"chat_id": chat_id, "caption": caption}, files={"document": f})
+        tg_api("sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": f})
 
-def extract_text_from_tg_pdf(file_id: str) -> str:
+def extract_pdf_text(file_id: str) -> str:
     import requests
     from pypdf import PdfReader
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    file_info = requests.get(f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}").json()
-    file_path = file_info["result"]["file_path"]
-    download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-    response = requests.get(download_url)
-    reader = PdfReader(io.BytesIO(response.content))
+    file_path = tg_api("getFile", {"file_id": file_id})["result"]["file_path"]
+    resp = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}")
+    reader = PdfReader(io.BytesIO(resp.content))
     return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
 def format_job_table(jobs: List[Dict]) -> str:
-    table = "| # | Platform | Title | Link |\n|---|---|---|---|\n"
-    for idx, j in enumerate(jobs, 1):
-        table += f"| {idx} | {j['platform']} | {j['title']} | [Apply Link]({j['link']}) |\n"
-    return table
+    if not jobs: return "No jobs found. Try adjusting role/location."
+    return "\n".join([f"🔹 *{j['platform']}*: [{j['title']}]({j['link']})" for j in jobs])
 
-def export_to_harvard_pdf(data: HarvardResume, output_filename="/tmp/tailored_resume.pdf"):
+def export_to_pdf(data: HarvardResume, output_filename="/tmp/tailored_resume.pdf"):
     from weasyprint import HTML
-    skills_html = ""
-    for category in data.technical_skills:
-        sub_list = "".join([f"<li>{sub}</li>" for sub in category.subcategories])
-        skills_html += f"<ul><li><strong>{category.category_name}</strong><ul>{sub_list}</ul></li></ul>"
-    education_html = ""
-    for edu in data.education:
-        education_html += f"<div><strong>{edu.degree}</strong> - {edu.institution} ({edu.duration})</div>"
-    experience_html = ""
-    for exp in data.work_experience:
-        bullets = "".join([f"<li>{b}</li>" for b in exp.achievements])
-        experience_html += f"<div><strong>{exp.company} - {exp.role}</strong> ({exp.duration})<ul>{bullets}</ul></div>"
-    html_content = f"""
-    <html><head><style>body{{font-family:Arial; line-height:1.4;}}</style></head><body>
-    <h1>{data.personal_info.name}</h1>
-    <p>LinkedIn: {data.personal_info.linkedin} | Email: {data.personal_info.email} | GitHub: {data.personal_info.github}</p>
-    <h2>Technical Skills</h2>{skills_html}
-    <h2>Education</h2>{education_html}
-    <h2>Work Experience</h2>{experience_html}
+    skills = "".join([f"<div class='skills-container'><strong>{c.category_name}:</strong> {', '.join(c.subcategories)}</div>" for c in data.technical_skills])
+    edu = "".join([f"<div class='item'><div class='item-header'><span class='item-title'>{e.institution}</span><span class='item-date'>{e.duration}</span></div><div class='item-subtitle'>{e.degree}</div></div>" for e in data.education])
+    exp = "".join([f"<div class='item'><div class='item-header'><span class='item-title'>{j.company}</span><span class='item-date'>{j.duration}</span></div><div class='item-subtitle'>{j.role}</div><ul class='bullet-points'>{''.join([f'<li>{a}</li>' for a in j.achievements])}</ul></div>" for j in data.work_experience])
+    proj = "".join([f"<div class='item'><div class='item-header'><span class='item-title'>{p.title}</span></div><div class='item-subtitle'><a href='{p.link or '#'}'>{p.link or ''}</a></div><ul class='bullet-points'>{''.join([f'<li>{a}</li>' for a in p.achievements])}</ul></div>" for p in data.key_projects])
+    
+    html = f"""<html><head>{ENHANCED_RESUME_CSS}</head><body>
+    <header><h1>{data.personal_info.name}</h1><div class='contact-info'><span>{data.personal_info.email}</span> | <span>{data.personal_info.linkedin}</span> | <span>{data.personal_info.github}</span></div></header>
+    <section><h2>Technical Skills</h2>{skills}</section>
+    <section><h2>Experience</h2>{exp}</section>
+    <section><h2>Key Projects</h2>{proj}</section>
+    <section><h2>Education</h2>{edu}</section>
     </body></html>"""
-    HTML(string=html_content).write_pdf(output_filename)
+    HTML(string=html).write_pdf(output_filename)
 
-class ResumeBot:
+# ==================== BOT CONTROLLER (ASYNC/SYNC BLEND) ====================
+class BotController:
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
         self.storage = StorageService()
         self.gemini = GeminiService()
         self.scraper = ScraperService()
         self.profile = self.storage.get_or_create_profile(chat_id)
+        self.menu_text = "\n\n📋 *Commands:* /start | /scrape | /tailor | /fixissues | /changeresume"
 
-    def send(self, text: str):
-        send_tg_message(self.chat_id, text)
+    async def spinner_task(self, msg_id: int, base_text: str):
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        try:
+            for frame in itertools.cycle(frames):
+                edit_message(self.chat_id, msg_id, f"⏳ {base_text}... `{frame}`")
+                await asyncio.sleep(1.2)
+        except asyncio.CancelledError:
+            pass
 
-    def send_doc(self, path: str, caption: str):
-        send_tg_document(self.chat_id, path, caption)
-
-    def send_menu(self):
-        self.send("""📋 *Commands:*
-/start
-/scrape
-/tailor
-/changeresume
-/fix-ats""")
-
-    def handle(self, text: str, message: dict):
+    async def handle_async(self, text: str, message: dict):
         state = self.profile.get("current_state", "IDLE")
 
-        if text == "/start": return self._handle_start()
-        if text in ["/scrape", "/newscrape"]: return self._handle_scrape_start()
-        if text == "/tailor": return self._handle_direct_tailor()
-        if text == "/changeresume": return self._handle_change_resume()
-        if text == "/fix-ats": return self._handle_fix_ats()
+        if text == "/start": return self._start()
+        if text in ["/scrape", "/newscrape"]: return self._ask_role()
+        if text == "/tailor": return self._ask_tailor()
+        if text == "/changeresume": return self._change_resume()
+        if text in ["/fixissues", "/fix-issues"]: return self._fix_issues()
 
-        if state == "AWAITING_MASTER": return self._handle_master_upload(message)
-        if state == "AWAITING_LINKEDIN": return self._handle_linkedin_input(text)
-        if state == "AWAITING_GITHUB": return self._handle_github_input(text)
-        if state == "AWAITING_SCRAPE_ROLE": return self._handle_role_input(text)
-        if state == "AWAITING_SCRAPE_LOCATION": return self._handle_location_input(text)
-        if state == "AWAITING_JOB_LINK": return self._handle_job_link(text)
-        if state == "AWAITING_JOB_DESCRIPTION": return self._handle_direct_job_description(text)
-        if state == "INTERVIEW_MODE": return self._handle_interview_answer(text)
-        if state == "AWAITING_COVER_LETTER_CONFIRM": return self._handle_cover_letter_confirm(text)
+        if state == "AWAITING_MASTER": return self._process_master(message)
+        if state == "AWAITING_LINKEDIN": return self._process_linkedin(text)
+        if state == "AWAITING_GITHUB": return self._process_github(text)
+        if state == "AWAITING_SCRAPE_ROLE": return self._process_role(text)
+        if state == "AWAITING_SCRAPE_LOCATION": return await self._process_location(text)
+        if state == "AWAITING_JOB_LINK": return await self._process_job_link(text)
+        if state == "AWAITING_JOB_DESCRIPTION": return self._process_direct_job(text)
+        if state == "INTERVIEW_MODE": return self._process_interview(text)
+        if state == "AWAITING_COVER_LETTER_CONFIRM": return self._process_cover_letter(text)
 
-        self.send("Unknown command.")
-        self.send_menu()
-        return {"status": "ok"}
+        send_message(self.chat_id, "Unknown command." + self.menu_text)
 
-    def _handle_start(self):
+    def _start(self):
         if self.profile.get("master_resume"):
-            self.send("Welcome back!")
+            send_message(self.chat_id, "Welcome back! Ready to hunt." + self.menu_text)
         else:
-            self.send("Please upload your Master Resume as PDF.")
             self.storage.update(self.chat_id, {"current_state": "AWAITING_MASTER"})
-        self.send_menu()
+            send_message(self.chat_id, "Let's begin. Please upload your Master Resume as a PDF.")
 
-    def _handle_master_upload(self, message):
+    def _process_master(self, message):
         if "document" not in message or not message["document"].get("file_name", "").lower().endswith(".pdf"):
-            self.send("Please upload PDF.")
+            send_message(self.chat_id, "Please upload a PDF document.")
             return
-        self.send("Processing PDF...")
+        send_message(self.chat_id, "Processing PDF...")
         try:
-            raw_text = extract_text_from_tg_pdf(message["document"]["file_id"])
-            parsed = self.gemini.parse_master(raw_text)
+            raw = extract_pdf_text(message["document"]["file_id"])
+            parsed = self.gemini.parse_master(raw)
             self.storage.update(self.chat_id, {"master_resume": parsed.model_dump(), "current_state": "AWAITING_LINKEDIN"})
-            self.send(f"Resume parsed for {parsed.personal_info.name}. Send LinkedIn URL:")
+            send_message(self.chat_id, f"Parsed details for {parsed.personal_info.name}. Now, send your LinkedIn URL:")
         except Exception as e:
-            self.send(f"Error: {str(e)}")
+            send_message(self.chat_id, f"Parse error: {e}")
 
-    def _handle_linkedin_input(self, text: str):
+    def _process_linkedin(self, text):
         self.storage.update(self.chat_id, {"linkedin": text, "current_state": "AWAITING_GITHUB"})
-        self.send("Send GitHub URL:")
+        send_message(self.chat_id, "Got it. Now send your GitHub URL:")
 
-    def _handle_github_input(self, text: str):
+    def _process_github(self, text):
+        msg_id = send_message(self.chat_id, "⏳ Deep-analyzing GitHub repositories...")
         self.storage.update(self.chat_id, {"github": text})
-        self.send("Analyzing GitHub...")
-        analysis = self.gemini.analyze_github(text)
-        self.send(analysis)
+        
+        raw_repos = self.scraper.scrape_github_repos(text)
+        if raw_repos:
+            analysis = self.gemini.select_top_github_projects(raw_repos)
+            projects = [ProjectEntry(title=p.title, link=p.live_link, achievements=p.achievements).model_dump() for p in analysis.top_projects]
+            self.storage.update(self.chat_id, {"github_projects": projects})
+            edit_message(self.chat_id, msg_id, "✅ GitHub analyzed! Top projects staged for injection." + self.menu_text)
+        else:
+            edit_message(self.chat_id, msg_id, "⚠️ No public repos found. Moving on." + self.menu_text)
         self.storage.update(self.chat_id, {"current_state": "IDLE"})
-        self.send_menu()
 
-    def _handle_change_resume(self):
-        self.send("Upload new Master Resume PDF.")
+    def _change_resume(self):
         self.storage.update(self.chat_id, {"current_state": "AWAITING_MASTER", "master_resume": {}})
+        send_message(self.chat_id, "Upload your new Master Resume PDF.")
 
-    def _handle_scrape_start(self):
-        if not self.profile.get("master_resume"):
-            self.send("Upload master resume first.")
-            return
-        self.send("What role are you targeting?")
+    def _ask_role(self):
         self.storage.update(self.chat_id, {"current_state": "AWAITING_SCRAPE_ROLE"})
+        send_message(self.chat_id, "What job role are you targeting? (e.g., Full Stack Developer)")
 
-    def _handle_role_input(self, text: str):
+    def _process_role(self, text):
         self.storage.update(self.chat_id, {"target_role": text, "current_state": "AWAITING_SCRAPE_LOCATION"})
-        self.send("What location?")
+        send_message(self.chat_id, "What location? (e.g., Remote, Lagos, New York)")
 
-    def _handle_location_input(self, text: str):
+    async def _process_location(self, text):
         self.storage.update(self.chat_id, {"target_location": text, "current_state": "AWAITING_JOB_LINK"})
-        jobs = self.scraper.fetch_job_listings(self.profile.get("target_role"), text)
-        self.send(f"Found jobs:\n\n{format_job_table(jobs)}\nSend the link you want.")
+        msg_id = send_message(self.chat_id, "⏳ Firing up Playwright...")
+        spinner = asyncio.create_task(self.spinner_task(msg_id, "Scraping Jobberman, LinkedIn, & RemoteOK"))
+        
+        jobs = await self.scraper.fetch_job_listings_async(self.profile["target_role"], text)
+        spinner.cancel()
+        
+        edit_message(self.chat_id, msg_id, f"✅ Jobs Found:\n\n{format_job_table(jobs)}\n\n*Reply with the exact link you want to target.*" + self.menu_text)
 
-    def _handle_job_link(self, text: str):
-        if not text.startswith("http"):
-            self.send("Send valid URL.")
-            return
-        job_desc = self.scraper.extract_job_description(text)
-        self.storage.update(self.chat_id, {"job_desc": job_desc})
-        self._process_job_tailoring(job_desc)
-
-    def _handle_direct_tailor(self):
-        self.send("Paste full job description:")
+    def _ask_tailor(self):
         self.storage.update(self.chat_id, {"current_state": "AWAITING_JOB_DESCRIPTION"})
+        send_message(self.chat_id, "Paste the full job description text:")
 
-    def _handle_direct_job_description(self, text: str):
-        if len(text) < 100:
-            self.send("Paste longer description.")
+    async def _process_job_link(self, text):
+        if not text.startswith("http"):
+            send_message(self.chat_id, "Please send a valid URL.")
             return
-        self.storage.update(self.chat_id, {"job_desc": text})
-        self._process_job_tailoring(text)
+            
+        msg_id = send_message(self.chat_id, "⏳ Initializing...")
+        spinner = asyncio.create_task(self.spinner_task(msg_id, "Extracting JS-rendered job page"))
+        
+        job_desc = await self.scraper.extract_job_description_async(text)
+        spinner.cancel()
+        
+        self.storage.update(self.chat_id, {"job_desc": job_desc})
+        edit_message(self.chat_id, msg_id, "✅ Page extracted. Evaluating gaps...")
+        self._evaluate_and_route(job_desc)
 
-    def _process_job_tailoring(self, job_desc: str):
+    def _process_direct_job(self, text):
+        self.storage.update(self.chat_id, {"job_desc": text})
+        send_message(self.chat_id, "Evaluating job gaps...")
+        self._evaluate_and_route(text)
+
+    def _evaluate_and_route(self, job_desc):
         master = HarvardResume.model_validate(self.profile["master_resume"])
         gap = self.gemini.gap_interview(master, job_desc)
         if gap.needs_interview and gap.questions:
-            self.storage.update(self.chat_id, {"current_state": "INTERVIEW_MODE", "questions": gap.questions, "current_q_idx": 0, "job_desc": job_desc})
-            self.send(f"Question 1/{len(gap.questions)}: {gap.questions[0]}")
+            self.storage.update(self.chat_id, {"current_state": "INTERVIEW_MODE", "questions": gap.questions, "current_q_idx": 0})
+            send_message(self.chat_id, f"To tailor perfectly, answer this:\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
         else:
-            self._execute_final_tailoring(job_desc, "No additions required.")
+            self._execute_tailoring(job_desc, "No additions needed.")
 
-    def _handle_interview_answer(self, text: str):
+    def _process_interview(self, text):
         idx = self.profile["current_q_idx"]
         questions = self.profile["questions"]
         qa = self.profile.get("qa_responses", "") + f"Q: {questions[idx]}\nA: {text}\n\n"
         if idx + 1 < len(questions):
             self.storage.update(self.chat_id, {"current_q_idx": idx + 1, "qa_responses": qa})
-            self.send(f"Question {idx+2}/{len(questions)}: {questions[idx+1]}")
+            send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}")
         else:
-            self._execute_final_tailoring(self.profile["job_desc"], qa)
+            send_message(self.chat_id, "Got it. Compiling resume...")
+            self._execute_tailoring(self.profile["job_desc"], qa)
 
-    def _execute_final_tailoring(self, job_desc: str, interview_qa: str):
-        self.send("Tailoring resume...")
+    def _execute_tailoring(self, job_desc, qa):
         master = HarvardResume.model_validate(self.profile["master_resume"])
-        tailored = self.gemini.tailor_resume(master, job_desc, interview_qa)
+        gh_projects = [ProjectEntry.model_validate(p) for p in self.profile.get("github_projects", [])]
+        
+        tailored = self.gemini.tailor_resume(master, job_desc, qa, gh_projects)
         report = self.gemini.evaluate(tailored, job_desc)
-        target_role = self.profile.get("target_role", "Resume").replace(" ", "_")
-        pdf_path = f"/tmp/Tailored_{target_role}.pdf"
-        export_to_harvard_pdf(tailored, pdf_path)
-        self.send_doc(pdf_path, f"Tailored Resume - {target_role}")
-        self.send("ATS Report generated.")
-        self.storage.update(self.chat_id, {"current_state": "AWAITING_COVER_LETTER_CONFIRM", "last_tailored": tailored.model_dump(), "last_recommendations": report.actionable_improvements, "job_desc": job_desc})
-        self.send("Want Cover Letter? (yes/no)")
+        
+        pdf_path = "/tmp/Tailored_Resume.pdf"
+        export_to_pdf(tailored, pdf_path)
+        
+        send_doc(self.chat_id, pdf_path, f"ATS Score: {report.ats_score}/100\nVerdict: {report.ats_verdict}")
+        
+        self.storage.update(self.chat_id, {
+            "current_state": "AWAITING_COVER_LETTER_CONFIRM", 
+            "last_tailored": tailored.model_dump(),
+            "last_recommendations": report.actionable_improvements
+        })
+        send_message(self.chat_id, "Do you want a Cover Letter generated? (yes/no)" + self.menu_text)
 
-    def _handle_cover_letter_confirm(self, text: str):
-        if text.lower() in ["yes", "y"]:
+    def _process_cover_letter(self, text):
+        if text.lower() in ["y", "yes"]:
             master = HarvardResume.model_validate(self.profile["master_resume"])
             letter = self.gemini.cover_letter(master, self.profile["job_desc"])
-            self.send(f"Cover Letter:\n\n{letter}")
+            send_message(self.chat_id, f"📝 *Cover Letter*\n\n{letter}" + self.menu_text)
         else:
-            self.send("Skipped.")
+            send_message(self.chat_id, "Skipped." + self.menu_text)
         self.storage.update(self.chat_id, {"current_state": "IDLE"})
-        self.send_menu()
 
-    def _handle_fix_ats(self):
+    def _fix_issues(self):
         if not self.profile.get("last_tailored"):
-            self.send("No tailored resume found.")
+            send_message(self.chat_id, "No active tailored resume to fix.")
             return
-        self.send("Applying ATS fixes...")
-        self.send("Done.")
-        self.send_menu()
+        send_message(self.chat_id, "Applying HR recommendations...")
+        tailored = HarvardResume.model_validate(self.profile["last_tailored"])
+        fixed = self.gemini.ats_fix(tailored, self.profile.get("last_recommendations", []))
+        
+        pdf_path = "/tmp/Fixed_Resume.pdf"
+        export_to_pdf(fixed, pdf_path)
+        send_doc(self.chat_id, pdf_path, "Fixed ATS Resume based on feedback." + self.menu_text)
+        self.storage.update(self.chat_id, {"current_state": "IDLE", "last_tailored": fixed.model_dump()})
 
+# ==================== MODAL BACKGROUND HANDLER ====================
+@app.function(secrets=[modal.Secret.from_name("resume-agent-secret")], timeout=300)
+def process_update_in_background(request_data: dict):
+    msg = request_data.get("message")
+    if not msg: return
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "").strip()
+    bot = BotController(chat_id)
+    asyncio.run(bot.handle_async(text, msg))
+
+# ==================== MODAL WEBHOOK ====================
 @app.function(secrets=[modal.Secret.from_name("resume-agent-secret")])
 @modal.fastapi_endpoint(method="POST")
 def telegram_webhook(request: dict):
-    if "message" not in request:
-        return {"status": "ignored"}
-    msg = request["message"]
-    bot = ResumeBot(msg["chat"]["id"])
-    return bot.handle(msg.get("text", "").strip(), msg)
+    # Pass the heavy lifting to the background task to prevent Telegram from timing out
+    process_update_in_background.spawn(request)
+    return {"status": "ok"}
 
+# ==================== CRON JOB ====================
 @app.function(schedule=modal.Cron("0 8 * * *", timezone="Africa/Lagos"), secrets=[modal.Secret.from_name("resume-agent-secret")])
 def daily_job_scrape_cron():
     from supabase import create_client
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     res = supabase.table("profiles").select("*").execute()
     for user in res.data:
-        chat_id = user.get("chat_id")
-        role = user.get("target_role")
-        location = user.get("target_location")
-        if chat_id and role and location:
+        chat_id, role, loc = user.get("chat_id"), user.get("target_role"), user.get("target_location")
+        if chat_id and role and loc:
             scraper = ScraperService()
-            jobs = scraper.fetch_job_listings(role, location)
-            msg = f"🌅 Good morning! Jobs for `{role}` in `{location}`\n\n{format_job_table(jobs)}\nReply with link to tailor."
-            send_tg_message(chat_id, msg)
+            jobs = asyncio.run(scraper.fetch_job_listings_async(role, loc))
+            msg = f"🌅 Good morning! Fresh jobs for `{role}` in `{loc}`\n\n{format_job_table(jobs)}\n\n*Reply with a link to tailor.*"
+            send_message(chat_id, msg)
             supabase.table("profiles").update({"current_state": "AWAITING_JOB_LINK"}).eq("chat_id", chat_id).execute()
