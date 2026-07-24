@@ -163,6 +163,17 @@ Job Description:\n{job_description}\nCandidate's Answers:\n{interview_qa}"""
     def evaluate(self, tailored: HarvardResume, job_description: str) -> AnalyticsReport:
         prompt = f"You are an elite corporate recruiter. Critique this tailored resume.\nResume: {tailored.model_dump_json()}\nJob: {job_description}"
         return self._structured(prompt, AnalyticsReport, 0.2)
+        
+    def transcribe_audio(self, audio_bytes: bytes) -> str:
+        prompt = "You are an expert transcriptionist. Transcribe this audio exactly as spoken. Do not summarize or add commentary. Just return the spoken text."
+        resp = self.client.models.generate_content(
+            model=self.model,
+            contents=[
+                self.types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"),
+                prompt
+            ]
+        )
+        return resp.text
 
 class StorageService:
     def __init__(self):
@@ -213,7 +224,6 @@ class ScraperService:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 
-                # 1. LinkedIn
                 try:
                     await page.goto(f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}", timeout=15000)
                     cards = await page.query_selector_all("div.base-search-card")
@@ -223,7 +233,6 @@ class ScraperService:
                         results.append({"title": title.strip(), "platform": "LinkedIn", "link": link.split('?')[0]})
                 except Exception: pass
 
-                # 2. RemoteOK
                 try:
                     await page.goto(f"https://remoteok.com/remote-{role.lower().replace(' ', '-')}-jobs", timeout=10000)
                     jobs = await page.query_selector_all("tr.job")
@@ -233,7 +242,6 @@ class ScraperService:
                         results.append({"title": title.strip(), "platform": "RemoteOK", "link": f"https://remoteok.com{link}"})
                 except Exception: pass
 
-                # 3. Jobberman
                 try:
                     await page.goto(f"https://www.jobberman.com/jobs?q={role.replace(' ', '+')}&l={location.replace(' ', '+')}", timeout=10000)
                     links = await page.query_selector_all("a[href*='/job/']")
@@ -291,6 +299,14 @@ def extract_pdf_text(file_id: str) -> str:
     reader = PdfReader(io.BytesIO(resp.content))
     return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
+def download_tg_voice(file_id: str) -> bytes:
+    import requests
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    file_info = tg_api("getFile", {"file_id": file_id})
+    file_path = file_info["result"]["file_path"]
+    resp = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}")
+    return resp.content
+
 def format_job_table(jobs: List[Dict]) -> str:
     if not jobs: return "No jobs found. Try adjusting role/location."
     return "\n".join([f"🔹 *{j['platform']}*: [{j['title']}]({j['link']})" for j in jobs])
@@ -311,7 +327,7 @@ def export_to_pdf(data: HarvardResume, output_filename="/tmp/tailored_resume.pdf
     </body></html>"""
     HTML(string=html).write_pdf(output_filename)
 
-# ==================== BOT CONTROLLER (ASYNC/SYNC BLEND) ====================
+# ==================== BOT CONTROLLER ====================
 class BotController:
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
@@ -330,15 +346,18 @@ class BotController:
         except asyncio.CancelledError:
             pass
 
-    async def handle_async(self, text: str, message: dict):
+    async def handle_async(self, message: dict):
         state = self.profile.get("current_state", "IDLE")
+        text = message.get("text", "").strip() if "text" in message else ""
 
+        # Commands override state if they are text
         if text == "/start": return self._start()
         if text in ["/scrape", "/newscrape"]: return self._ask_role()
         if text == "/tailor": return self._ask_tailor()
         if text == "/changeresume": return self._change_resume()
         if text in ["/fixissues", "/fix-issues"]: return self._fix_issues()
 
+        # State Routing
         if state == "AWAITING_MASTER": return self._process_master(message)
         if state == "AWAITING_LINKEDIN": return self._process_linkedin(text)
         if state == "AWAITING_GITHUB": return self._process_github(text)
@@ -346,7 +365,7 @@ class BotController:
         if state == "AWAITING_SCRAPE_LOCATION": return await self._process_location(text)
         if state == "AWAITING_JOB_LINK": return await self._process_job_link(text)
         if state == "AWAITING_JOB_DESCRIPTION": return self._process_direct_job(text)
-        if state == "INTERVIEW_MODE": return self._process_interview(text)
+        if state == "INTERVIEW_MODE": return self._process_interview(message)
         if state == "AWAITING_COVER_LETTER_CONFIRM": return self._process_cover_letter(text)
 
         send_message(self.chat_id, "Unknown command." + self.menu_text)
@@ -440,17 +459,35 @@ class BotController:
         gap = self.gemini.gap_interview(master, job_desc)
         if gap.needs_interview and gap.questions:
             self.storage.update(self.chat_id, {"current_state": "INTERVIEW_MODE", "questions": gap.questions, "current_q_idx": 0})
-            send_message(self.chat_id, f"To tailor perfectly, answer this:\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
+            send_message(self.chat_id, f"To tailor perfectly, answer this (Text or Voice Note):\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
         else:
             self._execute_tailoring(job_desc, "No additions needed.")
 
-    def _process_interview(self, text):
+    def _process_interview(self, message: dict):
+        # Handle Voice Note Transcription
+        if "voice" in message:
+            send_message(self.chat_id, "🎙️ Listening and transcribing...")
+            try:
+                audio_bytes = download_tg_voice(message["voice"]["file_id"])
+                answer_text = self.gemini.transcribe_audio(audio_bytes)
+                send_message(self.chat_id, f"📝 *Transcript:* {answer_text}")
+            except Exception as e:
+                send_message(self.chat_id, f"Failed to transcribe audio: {e}. Please type your answer.")
+                return
+        elif "text" in message:
+            answer_text = message["text"].strip()
+        else:
+            send_message(self.chat_id, "Please reply with text or a voice note.")
+            return
+
+        # Proceed with saving the answer
         idx = self.profile["current_q_idx"]
         questions = self.profile["questions"]
-        qa = self.profile.get("qa_responses", "") + f"Q: {questions[idx]}\nA: {text}\n\n"
+        qa = self.profile.get("qa_responses", "") + f"Q: {questions[idx]}\nA: {answer_text}\n\n"
+        
         if idx + 1 < len(questions):
             self.storage.update(self.chat_id, {"current_q_idx": idx + 1, "qa_responses": qa})
-            send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}")
+            send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}\n*(Reply with Text or Voice)*")
         else:
             send_message(self.chat_id, "Got it. Compiling resume...")
             self._execute_tailoring(self.profile["job_desc"], qa)
@@ -502,15 +539,14 @@ def process_update_in_background(request_data: dict):
     msg = request_data.get("message")
     if not msg: return
     chat_id = msg["chat"]["id"]
-    text = msg.get("text", "").strip()
     bot = BotController(chat_id)
-    asyncio.run(bot.handle_async(text, msg))
+    # Pass the entire message object so we can check for voice/text inside the router
+    asyncio.run(bot.handle_async(msg))
 
 # ==================== MODAL WEBHOOK ====================
 @app.function(secrets=[modal.Secret.from_name("resume-agent-secret")])
 @modal.fastapi_endpoint(method="POST")
 def telegram_webhook(request: dict):
-    # Pass the heavy lifting to the background task to prevent Telegram from timing out
     process_update_in_background.spawn(request)
     return {"status": "ok"}
 
