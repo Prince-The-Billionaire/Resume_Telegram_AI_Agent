@@ -163,9 +163,9 @@ Job Description:\n{job_description}\nCandidate's Answers:\n{interview_qa}"""
     def evaluate(self, tailored: HarvardResume, job_description: str) -> AnalyticsReport:
         prompt = f"You are an elite corporate recruiter. Critique this tailored resume.\nResume: {tailored.model_dump_json()}\nJob: {job_description}"
         return self._structured(prompt, AnalyticsReport, 0.2)
-        
+
     def transcribe_audio(self, audio_bytes: bytes) -> str:
-        prompt = "You are an expert transcriptionist. Transcribe this audio exactly as spoken. Do not summarize or add commentary. Just return the spoken text."
+        prompt = "You are an expert transcriptionist. Transcribe this audio exactly as spoken. Do not summarize or add commentary. Just return the verbatim spoken text."
         resp = self.client.models.generate_content(
             model=self.model,
             contents=[
@@ -224,6 +224,7 @@ class ScraperService:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 
+                # 1. LinkedIn
                 try:
                     await page.goto(f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}", timeout=15000)
                     cards = await page.query_selector_all("div.base-search-card")
@@ -233,6 +234,7 @@ class ScraperService:
                         results.append({"title": title.strip(), "platform": "LinkedIn", "link": link.split('?')[0]})
                 except Exception: pass
 
+                # 2. RemoteOK
                 try:
                     await page.goto(f"https://remoteok.com/remote-{role.lower().replace(' ', '-')}-jobs", timeout=10000)
                     jobs = await page.query_selector_all("tr.job")
@@ -242,6 +244,7 @@ class ScraperService:
                         results.append({"title": title.strip(), "platform": "RemoteOK", "link": f"https://remoteok.com{link}"})
                 except Exception: pass
 
+                # 3. Jobberman
                 try:
                     await page.goto(f"https://www.jobberman.com/jobs?q={role.replace(' ', '+')}&l={location.replace(' ', '+')}", timeout=10000)
                     links = await page.query_selector_all("a[href*='/job/']")
@@ -459,16 +462,27 @@ class BotController:
         gap = self.gemini.gap_interview(master, job_desc)
         if gap.needs_interview and gap.questions:
             self.storage.update(self.chat_id, {"current_state": "INTERVIEW_MODE", "questions": gap.questions, "current_q_idx": 0})
-            send_message(self.chat_id, f"To tailor perfectly, answer this (Text or Voice Note):\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
+            send_message(self.chat_id, f"To tailor perfectly, answer this (Text or Voice under 90s):\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
         else:
             self._execute_tailoring(job_desc, "No additions needed.")
 
     def _process_interview(self, message: dict):
         # Handle Voice Note Transcription
         if "voice" in message:
+            voice_meta = message["voice"]
+            duration = voice_meta.get("duration", 0)
+            
+            # Duration Check: Reject notes longer than 90 seconds
+            if duration > 90:
+                send_message(
+                    self.chat_id, 
+                    f"⚠️ *Voice note too long* ({duration}s).\nPlease keep your answer under 90 seconds, or reply with a text message."
+                )
+                return
+
             send_message(self.chat_id, "🎙️ Listening and transcribing...")
             try:
-                audio_bytes = download_tg_voice(message["voice"]["file_id"])
+                audio_bytes = download_tg_voice(voice_meta["file_id"])
                 answer_text = self.gemini.transcribe_audio(audio_bytes)
                 send_message(self.chat_id, f"📝 *Transcript:* {answer_text}")
             except Exception as e:
@@ -487,7 +501,7 @@ class BotController:
         
         if idx + 1 < len(questions):
             self.storage.update(self.chat_id, {"current_q_idx": idx + 1, "qa_responses": qa})
-            send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}\n*(Reply with Text or Voice)*")
+            send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}\n*(Reply with Text or Voice under 90s)*")
         else:
             send_message(self.chat_id, "Got it. Compiling resume...")
             self._execute_tailoring(self.profile["job_desc"], qa)
@@ -540,7 +554,6 @@ def process_update_in_background(request_data: dict):
     if not msg: return
     chat_id = msg["chat"]["id"]
     bot = BotController(chat_id)
-    # Pass the entire message object so we can check for voice/text inside the router
     asyncio.run(bot.handle_async(msg))
 
 # ==================== MODAL WEBHOOK ====================
