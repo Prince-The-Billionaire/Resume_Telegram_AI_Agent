@@ -11,7 +11,6 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== MODAL ENVIRONMENT SETUP ====================
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -32,7 +31,6 @@ image = (
 
 app = modal.App("ats-resume-bot", image=image)
 
-# ==================== SCHEMAS ====================
 class PersonalInfo(BaseModel):
     name: str
     email: str
@@ -97,7 +95,6 @@ class GitHubProjectInfo(BaseModel):
 class GitHubAnalysisResult(BaseModel):
     top_projects: List[GitHubProjectInfo]
 
-# ==================== CSS TEMPLATE ====================
 ENHANCED_RESUME_CSS = """
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -120,7 +117,6 @@ ENHANCED_RESUME_CSS = """
 </style>
 """
 
-# ==================== SERVICES ====================
 class GeminiService:
     def __init__(self):
         from google import genai
@@ -180,14 +176,17 @@ class StorageService:
         from supabase import create_client
         self.client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-    def get_or_create_profile(self, chat_id: int) -> dict:
+    def get_or_create_profile(self, chat_id: int, referral_source: str = "organic") -> dict:
         res = self.client.table("profiles").select("*").eq("chat_id", chat_id).execute()
-        if res.data: return res.data[0]
+        if res.data: 
+            if referral_source != "organic" and res.data[0].get("referral_source") != referral_source:
+                self.update(chat_id, {"referral_source": referral_source})
+            return res.data[0]
         new_profile = {
             "chat_id": chat_id, "master_resume": {}, "current_state": "IDLE",
             "job_desc": "", "questions": [], "current_q_idx": 0, "qa_responses": "",
             "last_tailored": {}, "last_recommendations": [], "target_role": "", "target_location": "",
-            "linkedin": "", "github": "", "github_projects": []
+            "linkedin": "", "github": "", "github_projects": [], "referral_source": referral_source
         }
         self.client.table("profiles").insert(new_profile).execute()
         return new_profile
@@ -224,35 +223,44 @@ class ScraperService:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 
-                # 1. LinkedIn
                 try:
                     await page.goto(f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}", timeout=15000)
                     cards = await page.query_selector_all("div.base-search-card")
-                    for card in cards[:3]:
+                    for card in cards[:15]:
                         title = await (await card.query_selector(".base-search-card__title")).inner_text()
                         link = await (await card.query_selector("a.base-card__full-link")).get_attribute("href")
                         results.append({"title": title.strip(), "platform": "LinkedIn", "link": link.split('?')[0]})
                 except Exception: pass
 
-                # 2. RemoteOK
                 try:
                     await page.goto(f"https://remoteok.com/remote-{role.lower().replace(' ', '-')}-jobs", timeout=10000)
                     jobs = await page.query_selector_all("tr.job")
-                    for job in jobs[:2]:
+                    for job in jobs[:10]:
                         title = await (await job.query_selector("h2")).inner_text()
                         link = await job.get_attribute("data-url")
                         results.append({"title": title.strip(), "platform": "RemoteOK", "link": f"https://remoteok.com{link}"})
                 except Exception: pass
 
-                # 3. Jobberman
                 try:
                     await page.goto(f"https://www.jobberman.com/jobs?q={role.replace(' ', '+')}&l={location.replace(' ', '+')}", timeout=10000)
                     links = await page.query_selector_all("a[href*='/job/']")
-                    for a in links[:2]:
+                    for a in links[:10]:
                         text = await a.inner_text()
                         href = await a.get_attribute("href")
                         if len(text.strip()) > 5:
                             results.append({"title": text.strip()[:60], "platform": "Jobberman", "link": href})
+                except Exception: pass
+                
+                try:
+                    search_query = f"site:x.com OR site:twitter.com \"hiring\" \"{role}\" \"{location}\""
+                    await page.goto(f"https://www.google.com/search?q={search_query.replace(' ', '+')}", timeout=15000)
+                    links = await page.query_selector_all("a[href*='x.com/'], a[href*='twitter.com/']")
+                    for a in links[:10]:
+                        href = await a.get_attribute("href")
+                        title_el = await a.query_selector("h3")
+                        if title_el and "status" in href:
+                            title = await title_el.inner_text()
+                            results.append({"title": title.strip(), "platform": "X (Twitter)", "link": href})
                 except Exception: pass
 
                 await browser.close()
@@ -275,7 +283,6 @@ class ScraperService:
         except Exception as e:
             return f"Context extraction failed. Role URL: {url}"
 
-# ==================== TELEGRAM HELPERS ====================
 def tg_api(method: str, payload: dict = None, files: dict = None):
     import requests
     url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}"
@@ -330,15 +337,21 @@ def export_to_pdf(data: HarvardResume, output_filename="/tmp/tailored_resume.pdf
     </body></html>"""
     HTML(string=html).write_pdf(output_filename)
 
-# ==================== BOT CONTROLLER ====================
 class BotController:
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
         self.storage = StorageService()
         self.gemini = GeminiService()
         self.scraper = ScraperService()
-        self.profile = self.storage.get_or_create_profile(chat_id)
-        self.menu_text = "\n\n📋 *Commands:* /start | /scrape | /tailor | /fixissues | /changeresume"
+        self.profile = {}
+        self.menu_text = (
+            "\n\n📋 *How to use this bot:*\n"
+            "🔹 /start - Restart the bot and view this menu.\n"
+            "🔹 /scrape - Search for active job openings by role & location.\n"
+            "🔹 /tailor - Instantly tailor your resume to a pasted job description.\n"
+            "🔹 /fixissues - Automatically apply HR recommendations to your last tailored draft.\n"
+            "🔹 /changeresume - Replace your master resume base file."
+        )
 
     async def spinner_task(self, msg_id: int, base_text: str):
         frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -350,17 +363,19 @@ class BotController:
             pass
 
     async def handle_async(self, message: dict):
-        state = self.profile.get("current_state", "IDLE")
         text = message.get("text", "").strip() if "text" in message else ""
+        
+        if text.startswith("/start"): 
+            return self._start(text)
+            
+        self.profile = self.storage.get_or_create_profile(self.chat_id)
+        state = self.profile.get("current_state", "IDLE")
 
-        # Commands override state if they are text
-        if text == "/start": return self._start()
         if text in ["/scrape", "/newscrape"]: return self._ask_role()
         if text == "/tailor": return self._ask_tailor()
         if text == "/changeresume": return self._change_resume()
         if text in ["/fixissues", "/fix-issues"]: return self._fix_issues()
 
-        # State Routing
         if state == "AWAITING_MASTER": return self._process_master(message)
         if state == "AWAITING_LINKEDIN": return self._process_linkedin(text)
         if state == "AWAITING_GITHUB": return self._process_github(text)
@@ -373,12 +388,16 @@ class BotController:
 
         send_message(self.chat_id, "Unknown command." + self.menu_text)
 
-    def _start(self):
+    def _start(self, text: str):
+        parts = text.split(" ")
+        referral = parts[1] if len(parts) > 1 else "organic"
+        self.profile = self.storage.get_or_create_profile(self.chat_id, referral_source=referral)
+        
         if self.profile.get("master_resume"):
             send_message(self.chat_id, "Welcome back! Ready to hunt." + self.menu_text)
         else:
             self.storage.update(self.chat_id, {"current_state": "AWAITING_MASTER"})
-            send_message(self.chat_id, "Let's begin. Please upload your Master Resume as a PDF.")
+            send_message(self.chat_id, "Let's begin. Please upload your Master Resume as a PDF." + self.menu_text)
 
     def _process_master(self, message):
         if "document" not in message or not message["document"].get("file_name", "").lower().endswith(".pdf"):
@@ -426,7 +445,7 @@ class BotController:
     async def _process_location(self, text):
         self.storage.update(self.chat_id, {"target_location": text, "current_state": "AWAITING_JOB_LINK"})
         msg_id = send_message(self.chat_id, "⏳ Firing up Playwright...")
-        spinner = asyncio.create_task(self.spinner_task(msg_id, "Scraping Jobberman, LinkedIn, & RemoteOK"))
+        spinner = asyncio.create_task(self.spinner_task(msg_id, "Scraping Jobberman, LinkedIn, RemoteOK, & X"))
         
         jobs = await self.scraper.fetch_job_listings_async(self.profile["target_role"], text)
         spinner.cancel()
@@ -467,12 +486,10 @@ class BotController:
             self._execute_tailoring(job_desc, "No additions needed.")
 
     def _process_interview(self, message: dict):
-        # Handle Voice Note Transcription
         if "voice" in message:
             voice_meta = message["voice"]
             duration = voice_meta.get("duration", 0)
             
-            # Duration Check: Reject notes longer than 90 seconds
             if duration > 90:
                 send_message(
                     self.chat_id, 
@@ -494,7 +511,6 @@ class BotController:
             send_message(self.chat_id, "Please reply with text or a voice note.")
             return
 
-        # Proceed with saving the answer
         idx = self.profile["current_q_idx"]
         questions = self.profile["questions"]
         qa = self.profile.get("qa_responses", "") + f"Q: {questions[idx]}\nA: {answer_text}\n\n"
@@ -547,7 +563,6 @@ class BotController:
         send_doc(self.chat_id, pdf_path, "Fixed ATS Resume based on feedback." + self.menu_text)
         self.storage.update(self.chat_id, {"current_state": "IDLE", "last_tailored": fixed.model_dump()})
 
-# ==================== MODAL BACKGROUND HANDLER ====================
 @app.function(secrets=[modal.Secret.from_name("resume-agent-secret")], timeout=300)
 def process_update_in_background(request_data: dict):
     msg = request_data.get("message")
@@ -556,14 +571,12 @@ def process_update_in_background(request_data: dict):
     bot = BotController(chat_id)
     asyncio.run(bot.handle_async(msg))
 
-# ==================== MODAL WEBHOOK ====================
 @app.function(secrets=[modal.Secret.from_name("resume-agent-secret")])
 @modal.fastapi_endpoint(method="POST")
 def telegram_webhook(request: dict):
     process_update_in_background.spawn(request)
     return {"status": "ok"}
 
-# ==================== CRON JOB ====================
 @app.function(schedule=modal.Cron("0 8 * * *", timezone="Africa/Lagos"), secrets=[modal.Secret.from_name("resume-agent-secret")])
 def daily_job_scrape_cron():
     from supabase import create_client
