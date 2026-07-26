@@ -171,6 +171,21 @@ Job Description:\n{job_description}\nCandidate's Answers:\n{interview_qa}"""
         )
         return resp.text
 
+    def cover_letter(self, master: HarvardResume, job_description: str) -> str:
+        prompt = f"""You are an expert career coach. Write a highly tailored, professional cover letter based on this candidate's resume and the target job description. Make it compelling, concise, and ready to send without placeholder brackets.
+        
+Resume:
+{master.model_dump_json()}
+
+Job Description:
+{job_description}"""
+        
+        resp = self.client.models.generate_content(
+            model=self.model, 
+            contents=prompt
+        )
+        return resp.text
+
 class StorageService:
     def __init__(self):
         from supabase import create_client
