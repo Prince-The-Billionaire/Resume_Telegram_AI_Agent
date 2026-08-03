@@ -28,7 +28,7 @@ image = (
     .apt_install("fonts-dejavu", "fonts-liberation", "fontconfig", "libglib2.0-0", "libcairo2", "libpango-1.0-0", "libpangocairo-1.0-0")
 )
 
-app = modal.App("z-node-career-agent", image=image)
+app = modal.App("ats-resume-bot", image=image)
 
 # --- Pydantic Models ---
 class PersonalInfo(BaseModel):
@@ -36,7 +36,7 @@ class PersonalInfo(BaseModel):
     email: str
     phone: Optional[str] = None
     linkedin: str
-    github: str
+    github: Optional[str] = None          # now optional – can hold GitHub, Behance, or any portfolio URL
 
 class SkillCategory(BaseModel):
     category_name: str
@@ -53,7 +53,7 @@ class JobEntry(BaseModel):
     company: str
     role: str
     duration: str
-    achievements: List[str]  # Stored as narrative sentences
+    achievements: List[str]
 
 class ProjectEntry(BaseModel):
     title: str
@@ -76,7 +76,7 @@ class TechnicalGapInterrogator(BaseModel):
     needs_interview: bool
     questions: List[str]
 
-class GitHubProjectInfo(BaseModel):
+class GitHubProjectInfo(BaseModel):          # kept name for compatibility; used for any portfolio
     title: str
     description: str
     live_link: Optional[str] = None
@@ -105,27 +105,78 @@ class ScoredJob(BaseModel):
 class JobRankerResult(BaseModel):
     top_matches: List[ScoredJob]
 
-# --- CSS (No bullets for experience) ---
-ENHANCED_RESUME_CSS = """
+# --- CSS (Harvard Standard) – UNCHANGED ---
+HARVARD_RESUME_CSS = """
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-  :root { --primary-color: #0f172a; --accent-color: #2563eb; --text-dark: #1e293b; --text-muted: #64748b; --border-color: #e2e8f0; }
+  @page {
+      margin: 0.5in;
+      size: letter;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Inter', system-ui, sans-serif; color: var(--text-dark); background-color: #ffffff; line-height: 1.6; padding: 2rem; max-width: 850px; margin: 0 auto; }
-  header { border-bottom: 2px solid var(--border-color); padding-bottom: 1.5rem; margin-bottom: 2rem; text-align: center; }
-  header h1 { font-size: 2.25rem; font-weight: 700; color: var(--primary-color); letter-spacing: -0.025em; }
-  .contact-info { display: flex; justify-content: center; flex-wrap: wrap; gap: 1rem; margin-top: 0.75rem; font-size: 0.875rem; color: var(--text-muted); }
-  section { margin-bottom: 1.5rem; }
-  section h2 { font-size: 1.15rem; font-weight: 600; color: var(--primary-color); text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border-color); padding-bottom: 0.25rem; margin-bottom: 1rem; }
-  .item { margin-bottom: 1.25rem; }
-  .item-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.25rem; }
-  .item-title { font-size: 1.05rem; font-weight: 600; color: var(--primary-color); }
-  .item-subtitle { color: var(--accent-color); font-weight: 500; }
-  .item-date { font-size: 0.85rem; color: var(--text-muted); font-weight: 400; }
-  .starl-content { margin-top: 0.5rem; font-size: 0.95rem; color: #334155; line-height: 1.6; text-align: justify; }
-  ul.bullet-points { list-style-type: disc; margin-left: 1.25rem; margin-top: 0.25rem; }
-  ul.bullet-points li { margin-bottom: 0.25rem; font-size: 0.95rem; color: #334155; }
-  .skills-container { margin-bottom: 0.5rem; font-size: 0.95rem; }
+  body { 
+      font-family: "Times New Roman", Times, serif; 
+      font-size: 12px; 
+      color: #000000; 
+      line-height: 1.3; 
+      background-color: #ffffff; 
+      max-width: 100%; 
+  }
+  header { 
+      text-align: center; 
+      margin-bottom: 12px; 
+  }
+  header h1 { 
+      font-size: 22px; 
+      font-weight: normal; 
+      text-transform: uppercase; 
+      margin-bottom: 4px;
+      letter-spacing: 1px;
+  }
+  .contact-info { 
+      font-size: 12px; 
+      text-align: center; 
+  }
+  .contact-info span { margin: 0 4px; }
+  a { 
+      color: #000000; 
+      text-decoration: none; 
+  }
+  section { margin-bottom: 12px; }
+  section h2 { 
+      font-size: 13px; 
+      font-weight: bold; 
+      text-transform: uppercase; 
+      border-bottom: 1px solid #000000; 
+      margin-top: 10px; 
+      margin-bottom: 6px; 
+      padding-bottom: 2px;
+  }
+  .item { margin-bottom: 8px; }
+  .item-header { 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: baseline; 
+  }
+  .item-title { font-weight: bold; }
+  .item-date { font-weight: normal; }
+  .item-subtitle { 
+      display: flex; 
+      justify-content: space-between; 
+      align-items: baseline; 
+      font-style: italic; 
+      margin-bottom: 3px; 
+  }
+  ul.bullet-points { 
+      list-style-type: disc; 
+      margin-left: 24px; 
+      margin-top: 2px; 
+  }
+  ul.bullet-points li { 
+      margin-bottom: 3px; 
+      text-align: justify;
+  }
+  .skills-container { margin-bottom: 4px; }
+  .skills-container strong { font-weight: bold; }
 </style>
 """
 
@@ -146,52 +197,64 @@ class GeminiService:
         return schema.model_validate_json(resp.text)
 
     def parse_master(self, raw_text: str) -> HarvardResume:
-        prompt = f"Parse this raw text resume directly into the structured schema.\n\n{raw_text}"
+        prompt = f"Parse this raw text resume directly into the structured schema. Treat any portfolio/GitHub/Behance links as optional.\n\n{raw_text}"
         return self._structured(prompt, HarvardResume, 0.1)
         
     def generate_master_from_dictation(self, raw_dictation: str) -> HarvardResume:
-        prompt = f"""You are an elite career agent converting unstructured dictation into a Master Resume. 
-CRITICAL FORMATTING RULE: For work experience 'achievements', DO NOT use bullet points. Write 1 to 2 flowing narrative sentences using the STARL method (Situation, Task, Action, Result, Learning).
+        prompt = f"""You are an elite career agent converting unstructured dictation into a Harvard-standard Master Resume. 
+This candidate may be from ANY field (software, marketing, oil & gas, design, international relations, engineering, etc.).
+CRITICAL FORMATTING RULE: For work experience and project 'achievements', use 1 to 3 punchy bullet points using the STARL method (Situation, Task, Action, Result, Learning). Do not use long paragraphs.
+If the candidate has no technical skills, still produce a clean skills section with relevant professional skills.
 Dictation:\n{raw_dictation}"""
         return self._structured(prompt, HarvardResume, 0.3)
 
     def select_top_github_projects(self, repos_data: List[dict]) -> GitHubAnalysisResult:
-        prompt = f"Analyze these GitHub repositories. Extract the top 3 strongest projects based on code complexity. Create strong narrative achievements for each.\nRepos:\n{json.dumps(repos_data, indent=2)}"
+        prompt = f"""Analyze these portfolio / repository items. Extract the top 3 strongest projects based on impact and complexity. 
+Create strong, bulleted achievements for each using STARL logic. Works for code, design, marketing campaigns, engineering projects, etc.
+Items:\n{json.dumps(repos_data, indent=2)}"""
+        return self._structured(prompt, GitHubAnalysisResult, 0.2)
+
+    def select_job_specific_github_projects(self, repos_data: List[dict], job_description: str) -> GitHubAnalysisResult:
+        prompt = f"""Analyze these portfolio / repository items and the target Job Description. 
+Extract the top 2 to 3 most relevant projects that specifically demonstrate the skills required. 
+Create strong, bulleted achievements for each using STARL logic. Field-agnostic (tech, marketing, design, engineering, etc.).
+Job Description:\n{job_description}\n\nItems:\n{json.dumps(repos_data, indent=2)}"""
         return self._structured(prompt, GitHubAnalysisResult, 0.2)
 
     def gap_interview(self, master: HarvardResume, job_description: str) -> TechnicalGapInterrogator:
-        prompt = f"""Compare the candidate's profile to the job description. Identify missing technical components.
+        prompt = f"""Compare the candidate's profile to the job description. Identify missing components (technical or professional).
 If a gap exists, frame your question by referencing their PAST EXPERIENCE to prompt a STARL response. 
-Example: 'I noticed you worked at Total Energies. Can you describe a time you used [Missing Skill] there to achieve a result, and what you learned?'
+This works for any industry. Do not assume the candidate is a software engineer.
 Resume:\n{master.model_dump_json()}\nJob Description:\n{job_description}"""
         return self._structured(prompt, TechnicalGapInterrogator, 0.3)
 
     def tailor_resume(self, master: HarvardResume, job_description: str, interview_qa: str, github_projects: List[ProjectEntry]) -> HarvardResume:
-        prompt = f"""You are an expert career agent formatting a resume.
+        prompt = f"""You are an expert career agent formatting a Harvard-standard resume for ANY profession.
 TAILORING RULES: 
-1. Rewrite the work experience 'achievements'. Write 1 to 2 flowing narrative sentences per role strictly using the STARL method (Situation, Task, Action, Result, Learning). DO NOT use bullet points.
-2. Intelligently weave critical missing keywords and technologies from the Job Description into the candidate's past roles based on their dictated answers. Ensure maximum ATS compatibility while making the integration look completely natural to a hiring manager.
-3. Add the synthesized GitHub projects into the key_projects section.
+1. Rewrite the work experience 'achievements' into 1 to 3 high-impact bullet points per role strictly using the STARL method.
+2. Intelligently weave critical missing keywords and technologies/skills from the Job Description into the candidate's past roles based on their dictated answers. Ensure maximum ATS compatibility.
+3. Replace the existing key_projects section entirely with the newly provided Projects (they may come from GitHub, Behance, or user dictation).
 Master Profile:\n{master.model_dump_json()}
-GitHub Projects:\n{json.dumps([p.model_dump() for p in github_projects], indent=2)}
+Job-Specific Projects to inject:\n{json.dumps([p.model_dump() for p in github_projects], indent=2)}
 Job Description:\n{job_description}\nCandidate's Dictated Answers:\n{interview_qa}"""
         return self._structured(prompt, HarvardResume, 0.2)
 
     def rank_jobs(self, master: HarvardResume, scraped_jobs: List[Dict]) -> JobRankerResult:
         prompt = f"""Analyze these scraped jobs against the master resume.
-Return ONLY the top 3-5 jobs where the candidate has the highest probability of passing ATS based on their specific stack.
-Provide a 1-sentence 'why_fit' explanation.
+Return ONLY the top 3-5 jobs where the candidate has the highest probability of passing ATS based on their specific background.
+Provide a 1-sentence 'why_fit' explanation. Field-agnostic.
 Resume:\n{master.model_dump_json()}\nScraped Jobs:\n{json.dumps(scraped_jobs)}"""
         return self._structured(prompt, JobRankerResult, 0.3)
 
     def generate_cheat_sheet(self, master: HarvardResume, job_description: str) -> ApplicationCheatSheet:
         prompt = f"""Analyze this job description and resume. 
 1. Score the match. 2. Explain why they win. 3. Predict the 3 most difficult custom application form questions and generate exact copy-paste answers.
+Works for any industry.
 Master Resume:\n{master.model_dump_json()}\nJob:\n{job_description}"""
         return self._structured(prompt, ApplicationCheatSheet, 0.3)
 
     def cover_letter(self, master: HarvardResume, job_description: str) -> str:
-        prompt = f"Write a highly tailored, compelling cover letter based on this resume and job description. Ready to send without placeholder brackets.\n\nResume:\n{master.model_dump_json()}\n\nJob:\n{job_description}"
+        prompt = f"Write a highly tailored, compelling cover letter based on this resume and job description. Ready to send without placeholder brackets. Suitable for any profession.\n\nResume:\n{master.model_dump_json()}\n\nJob:\n{job_description}"
         resp = self.client.models.generate_content(model=self.model, contents=prompt)
         return resp.text
 
@@ -228,16 +291,68 @@ class ScraperService:
     def scrape_github_repos(self, github_url: str) -> List[dict]:
         import requests
         username = github_url.rstrip('/').split('/')[-1]
-        api_url = f"https://api.github.com/users/{username}/repos?sort=updated&per_page=10"
+        api_url = f"https://api.github.com/users/{username}/repos?sort=updated&per_page=15"
         repos_data = []
         try:
             resp = requests.get(api_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             if resp.status_code == 200:
                 for r in resp.json():
                     if not r.get("fork"):
-                        repos_data.append({"name": r.get("name"), "description": r.get("description"), "language": r.get("language")})
-        except Exception: pass
+                        repos_data.append({
+                            "name": r.get("name"),
+                            "description": r.get("description"),
+                            "language": r.get("language"),
+                            "url": r.get("html_url")
+                        })
+        except Exception:
+            pass
         return repos_data
+
+    async def scrape_behance_projects(self, behance_url: str) -> List[dict]:
+        """Lightweight Behance project extraction via Playwright."""
+        from playwright.async_api import async_playwright
+        projects = []
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(behance_url, timeout=20000)
+                # Behance project cards
+                cards = await page.query_selector_all("div.ProjectCoverNeue-root-orQ, div.Cover-cover-s5i, a[href*='/gallery/']")
+                for card in cards[:12]:
+                    try:
+                        title_el = await card.query_selector("h3, .ProjectCoverNeue-title-*, .title")
+                        title = (await title_el.inner_text()).strip() if title_el else "Untitled Project"
+                        link = await card.get_attribute("href") or ""
+                        if link and not link.startswith("http"):
+                            link = "https://www.behance.net" + link
+                        projects.append({"name": title, "description": "", "url": link})
+                    except Exception:
+                        continue
+                await browser.close()
+        except Exception as e:
+            logger.error(f"Behance scrape error: {e}")
+        return projects
+
+    def scrape_portfolio(self, url: str) -> List[dict]:
+        """Unified entry point – detects domain and routes."""
+        if not url:
+            return []
+        url_l = url.lower()
+        if "github.com" in url_l:
+            return self.scrape_github_repos(url)
+        # Behance is async, so we handle it in the caller when needed
+        return []
+
+    async def scrape_portfolio_async(self, url: str) -> List[dict]:
+        if not url:
+            return []
+        url_l = url.lower()
+        if "github.com" in url_l:
+            return self.scrape_github_repos(url)
+        if "behance.net" in url_l:
+            return await self.scrape_behance_projects(url)
+        return []
 
     async def fetch_multi_platform_jobs(self, role: str, location: str) -> List[Dict]:
         from playwright.async_api import async_playwright
@@ -247,7 +362,6 @@ class ScraperService:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 
-                # 1. LinkedIn
                 try:
                     await page.goto(f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}", timeout=15000)
                     cards = await page.query_selector_all("div.base-search-card")
@@ -256,16 +370,8 @@ class ScraperService:
                         company = await (await card.query_selector(".base-search-card__subtitle")).inner_text()
                         link = await (await card.query_selector("a.base-card__full-link")).get_attribute("href")
                         results.append({"title": title.strip(), "company": company.strip(), "platform": "LinkedIn", "link": link.split('?')[0]})
-                except Exception: pass
-                
-                # 2. RemoteOK 
-                import requests
-                try:
-                    resp = requests.get(f"https://remoteok.com/api?tags={role.split()[0]}", headers={"User-Agent": "Mozilla/5.0"})
-                    if resp.status_code == 200:
-                        for job in resp.json()[1:6]:
-                            results.append({"title": job.get("position"), "company": job.get("company"), "platform": "RemoteOK", "link": job.get("url")})
-                except Exception: pass
+                except Exception:
+                    pass
                 
                 await browser.close()
         except Exception as e:
@@ -292,6 +398,18 @@ def tg_api(method: str, payload: dict = None, files: dict = None):
     resp = requests.post(url, json=payload if not files else None, data=payload if files else None, files=files)
     return resp.json()
 
+def set_bot_commands():
+    commands = [
+        {"command": "start", "description": "Start the bot & see main menu"},
+        {"command": "generate", "description": "Dictate your Master Resume (Voice/Text)"},
+        {"command": "scrape", "description": "Search jobs on LinkedIn & more"},
+        {"command": "tailor", "description": "Tailor resume using STARL method"},
+        {"command": "github", "description": "Sync GitHub / Behance / Portfolio projects"},
+        {"command": "changeresume", "description": "Upload a new Master Resume PDF"},
+        {"command": "stop", "description": "Pause daily job alerts"}
+    ]
+    tg_api("setMyCommands", {"commands": commands})
+
 def send_message(chat_id: int, text: str) -> int:
     res = tg_api("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
     return res.get("result", {}).get("message_id")
@@ -299,9 +417,11 @@ def send_message(chat_id: int, text: str) -> int:
 def edit_message(chat_id: int, msg_id: int, text: str):
     tg_api("editMessageText", {"chat_id": chat_id, "message_id": msg_id, "text": text, "parse_mode": "Markdown"})
 
-def send_doc(chat_id: int, file_path: str, caption: str):
+def send_doc(chat_id: int, file_path: str, caption: str = ""):
     with open(file_path, "rb") as f:
-        tg_api("sendDocument", {"chat_id": chat_id, "caption": caption}, files={"document": f})
+        # Keep caption short – Telegram hard limit is 1024 chars
+        safe_caption = (caption or "")[:1000]
+        tg_api("sendDocument", {"chat_id": chat_id, "caption": safe_caption}, files={"document": f})
 
 def download_tg_voice(file_id: str) -> bytes:
     import requests
@@ -322,21 +442,67 @@ def extract_pdf_text(file_id: str) -> str:
 
 def export_to_pdf(data: HarvardResume, output_filename="/tmp/resume.pdf"):
     from weasyprint import HTML
+    
+    # Technical Skills
     skills = "".join([f"<div class='skills-container'><strong>{c.category_name}:</strong> {', '.join(c.subcategories)}</div>" for c in data.technical_skills])
-    edu = "".join([f"<div class='item'><div class='item-header'><span class='item-title'>{e.institution}</span><span class='item-date'>{e.duration}</span></div><div class='item-subtitle'>{e.degree}</div></div>" for e in data.education])
     
-    # Rendering Work Experience as a STARL narrative paragraph
-    exp = "".join([f"<div class='item'><div class='item-header'><span class='item-title'>{j.company}</span><span class='item-date'>{j.duration}</span></div><div class='item-subtitle'>{j.role}</div><div class='starl-content'>{' '.join(j.achievements)}</div></div>" for j in data.work_experience])
+    # Education
+    edu = "".join([
+        f"<div class='item'>"
+        f"<div class='item-header'><span class='item-title'>{e.institution}</span><span class='item-date'>{e.duration}</span></div>"
+        f"<div class='item-subtitle'><span>{e.degree}</span><span>{e.grade or ''}</span></div>"
+        f"</div>" for e in data.education
+    ])
     
-    proj = "".join([f"<div class='item'><div class='item-header'><span class='item-title'>{p.title}</span></div><div class='item-subtitle'><a href='{p.link or '#'}'>{p.link or ''}</a></div><ul class='bullet-points'>{''.join([f'<li>{a}</li>' for a in p.achievements])}</ul></div>" for p in data.key_projects])
+    # Experience
+    exp = "".join([
+        f"<div class='item'>"
+        f"<div class='item-header'><span class='item-title'>{j.company}</span><span class='item-date'>{j.duration}</span></div>"
+        f"<div class='item-subtitle'><span>{j.role}</span></div>"
+        f"<ul class='bullet-points'>{''.join([f'<li>{ach}</li>' for ach in j.achievements])}</ul>"
+        f"</div>" for j in data.work_experience
+    ])
     
-    html = f"""<html><head>{ENHANCED_RESUME_CSS}</head><body>
-    <header><h1>{data.personal_info.name}</h1><div class='contact-info'><span>{data.personal_info.email}</span> | <span>{data.personal_info.linkedin}</span> | <span>{data.personal_info.github}</span></div></header>
+    # Projects
+    proj = "".join([
+        f"<div class='item'>"
+        f"<div class='item-header'><span class='item-title'>{p.title}</span><span class='item-date'><a href='{p.link or '#'}'>{p.link or ''}</a></span></div>"
+        f"<ul class='bullet-points'>{''.join([f'<li>{a}</li>' for a in p.achievements])}</ul>"
+        f"</div>" for p in data.key_projects
+    ])
+
+    # Interests
+    interests = "".join([f"<li><strong>{i.label}:</strong> {i.details}</li>" for i in data.interests]) if hasattr(data, 'interests') and data.interests else ""
+    interests_section = f"<section><h2>Interests</h2><ul class='bullet-points'>{interests}</ul></section>" if interests else ""
+    
+    # Contact line – handle missing / non-GitHub portfolio gracefully
+    pi = data.personal_info
+    contact_parts = []
+    if pi.linkedin:
+        contact_parts.append(f"<span>LinkedIn: <a href='{pi.linkedin}'>{pi.linkedin.split('/')[-1] if '/' in pi.linkedin else pi.linkedin}</a></span>")
+    if pi.email:
+        contact_parts.append(f"<span>Email: <a href='mailto:{pi.email}'>{pi.email}</a></span>")
+    if pi.github:
+        label = "GitHub" if "github.com" in pi.github.lower() else "Portfolio"
+        display = pi.github.split('/')[-1] if '/' in pi.github else pi.github
+        contact_parts.append(f"<span>{label}: <a href='{pi.github}'>{display}</a></span>")
+    if pi.phone:
+        contact_parts.append(f"<span>Phone: {pi.phone}</span>")
+    
+    contact_html = " | ".join(contact_parts)
+    
+    html = f"""<html><head>{HARVARD_RESUME_CSS}</head><body>
+    <header>
+        <h1>{pi.name}</h1>
+        <div class='contact-info'>{contact_html}</div>
+    </header>
     <section><h2>Technical Skills</h2>{skills}</section>
-    <section><h2>Experience</h2>{exp}</section>
-    <section><h2>Key Projects</h2>{proj}</section>
     <section><h2>Education</h2>{edu}</section>
+    <section><h2>Work Experience</h2>{exp}</section>
+    <section><h2>Key Projects</h2>{proj}</section>
+    {interests_section}
     </body></html>"""
+    
     HTML(string=html).write_pdf(output_filename)
 
 # --- Bot Controller ---
@@ -363,8 +529,7 @@ class BotController:
         if text == "/github": return self._trigger_github_sync()
 
         # Generation Flow
-        if state.startswith("GENERATE_"):
-            return self._process_generation(state, message)
+        if state.startswith("GENERATE_"): return self._process_generation(state, message)
 
         # File Upload Flow
         if state == "AWAITING_MASTER": return self._process_master(message)
@@ -380,27 +545,29 @@ class BotController:
         if state == "INTERVIEW_MODE": return self._process_interview(message)
         if state == "AWAITING_COVER_LETTER_CONFIRM": return self._process_cover_letter(text)
 
-        send_message(self.chat_id, "Command recognized. Type /start to see the full menu.")
+        send_message(self.chat_id, "Command recognized. Tap the 'Menu' button or type /start to see available options.")
 
     # --- Core Commands ---
     def _start(self):
+        set_bot_commands()
         self.storage.update(self.chat_id, {"cron_enabled": True})
         
         welcome_msg = """🤖 **Welcome to your AI Career Agent!** 
         
-Here is how I can help you land your next role:
+I work for *any* profession – software, marketing, oil & gas, design, international relations, engineering, and more.
 
-🎙️ **/generate** - Build your Master Resume from scratch. Simply send **Voice Notes** or text to dictate your experience, and I will format it into a Harvard-style PDF.
-🔍 **/scrape** (or **/newscrape**) - Tell me your target role and location. I will deploy scrapers (LinkedIn, RemoteOK, etc.) to return the highest-matching jobs.
-✂️ **/tailor** - Paste a job description. I will interview you on your gaps and rewrite your resume using the **STARL** method to weave in keywords and beat the ATS.
-🐙 **/github** - Connect your GitHub. I will scan your repos and automatically extract your top projects to inject into your resume.
-📄 **/changeresume** - Upload a new Master Resume PDF.
-🛑 **/stop** - Pause your daily automated job alerts.
+Tap the **Menu button** or use:
 
-Let's get to work! Upload a PDF as your Master Resume, or type /generate to start dictating."""
+🎙️ **/generate** – Build your Master Resume from scratch (voice or text).
+🔍 **/scrape** – Tell me your target role + location. I scrape & rank jobs.
+✂️ **/tailor** – Paste a job description. I rewrite your resume with the **STARL** method and inject the most relevant projects.
+🐙 **/github** – Sync GitHub, Behance, or any portfolio and update your Master Resume.
+📄 **/changeresume** – Upload a new Master Resume PDF.
+🛑 **/stop** – Pause daily job alerts.
+
+Upload a PDF as your Master Resume, or type /generate to start dictating."""
 
         send_message(self.chat_id, welcome_msg)
-        
         if not self.profile.get("master_resume"):
             self.storage.update(self.chat_id, {"current_state": "AWAITING_MASTER"})
 
@@ -422,46 +589,76 @@ Let's get to work! Upload a PDF as your Master Resume, or type /generate to star
             raw = extract_pdf_text(message["document"]["file_id"])
             parsed = self.gemini.parse_master(raw)
             self.storage.update(self.chat_id, {"master_resume": parsed.model_dump(), "current_state": "AWAITING_LINKEDIN"})
-            send_message(self.chat_id, f"Parsed. Now, send your LinkedIn URL:")
+            send_message(self.chat_id, "Parsed. Now send your LinkedIn URL:")
         except Exception as e:
             send_message(self.chat_id, f"Parse error: {e}")
 
     def _process_linkedin(self, text):
         self.storage.update(self.chat_id, {"linkedin": text, "current_state": "AWAITING_GITHUB"})
-        send_message(self.chat_id, "Received. Now send your GitHub URL:")
+        send_message(self.chat_id, "Received. Now send your **GitHub, Behance, or any portfolio URL**.\n\nIf you don’t have one, just type `skip`.")
 
     def _process_github_initial(self, text):
-        self.storage.update(self.chat_id, {"github": text, "current_state": "IDLE"})
-        self._execute_github_scan(text)
+        url = text.strip()
+        if url.lower() == "skip":
+            url = ""
+        self.storage.update(self.chat_id, {"github": url, "current_state": "IDLE"})
+        if url:
+            # fire-and-forget scan
+            asyncio.create_task(self._execute_portfolio_scan(url))
+        else:
+            send_message(self.chat_id, "✅ Profile saved. You can always add projects later with /github or during /tailor.")
 
-    # --- GitHub Sync Flow ---
+    # --- Portfolio / GitHub Sync Flow ---
     def _trigger_github_sync(self):
-        current_github = self.profile.get("github", "")
-        if current_github:
-            self._execute_github_scan(current_github)
+        current = self.profile.get("github", "")
+        if current:
+            asyncio.create_task(self._execute_portfolio_scan(current))
         else:
             self.storage.update(self.chat_id, {"current_state": "AWAITING_GITHUB_SYNC"})
-            send_message(self.chat_id, "No GitHub profile found. Please send your GitHub profile URL:")
+            send_message(self.chat_id, "No portfolio linked yet. Send your GitHub, Behance, or other portfolio URL (or type `skip`):")
 
     def _process_github_sync(self, text: str):
-        self.storage.update(self.chat_id, {"github": text, "current_state": "IDLE"})
-        self._execute_github_scan(text)
-
-    def _execute_github_scan(self, github_url: str):
-        msg_id = send_message(self.chat_id, "⏳ Deep-scanning GitHub for new projects...")
-        raw_repos = self.scraper.scrape_github_repos(github_url)
-        if raw_repos:
-            analysis = self.gemini.select_top_github_projects(raw_repos)
-            projects = [ProjectEntry(title=p.title, link=p.live_link, achievements=p.achievements).model_dump() for p in analysis.top_projects]
-            self.storage.update(self.chat_id, {"github_projects": projects})
-            edit_message(self.chat_id, msg_id, "✅ GitHub synced! Projects staged for your next application.")
+        url = text.strip()
+        if url.lower() == "skip":
+            url = ""
+        self.storage.update(self.chat_id, {"github": url, "current_state": "IDLE"})
+        if url:
+            asyncio.create_task(self._execute_portfolio_scan(url))
         else:
-            edit_message(self.chat_id, msg_id, "⚠️ No public repos found.")
+            send_message(self.chat_id, "Okay, no portfolio linked.")
+
+    async def _execute_portfolio_scan(self, portfolio_url: str):
+        msg_id = send_message(self.chat_id, "⏳ Deep-scanning your portfolio for projects...")
+        raw_items = await self.scraper.scrape_portfolio_async(portfolio_url)
+        
+        if raw_items:
+            analysis = self.gemini.select_top_github_projects(raw_items)
+            projects = [ProjectEntry(title=p.title, link=p.live_link or p.description, achievements=p.achievements).model_dump() for p in analysis.top_projects]
+            self.storage.update(self.chat_id, {"github_projects": projects})
+            
+            master_data = self.profile.get("master_resume")
+            if master_data:
+                master_data["key_projects"] = projects
+                # also keep the portfolio URL on the personal_info
+                if "personal_info" in master_data:
+                    master_data["personal_info"]["github"] = portfolio_url
+                self.storage.update(self.chat_id, {"master_resume": master_data})
+                
+                master = HarvardResume.model_validate(master_data)
+                pdf_path = "/tmp/Updated_Master.pdf"
+                export_to_pdf(master, pdf_path)
+                
+                edit_message(self.chat_id, msg_id, "✅ Portfolio synced! Generating your updated Master Resume...")
+                send_doc(self.chat_id, pdf_path, "📄 Updated Master Resume with your latest projects.")
+            else:
+                edit_message(self.chat_id, msg_id, "✅ Portfolio synced! Projects staged for your next application.")
+        else:
+            edit_message(self.chat_id, msg_id, "⚠️ No public projects found (or the site could not be scraped). You can still dictate projects during /generate or /tailor.")
 
     # --- Generation Flow ---
     def _start_generate(self):
         self.storage.update(self.chat_id, {"current_state": "GENERATE_PERSONAL", "generate_buffer": ""})
-        send_message(self.chat_id, "Let's build your Master Resume. You can type or send **Voice Notes**.\n\nFirst, tell me your full name, email, phone, LinkedIn, and GitHub links.")
+        send_message(self.chat_id, "Let's build your Master Resume. You can type or send **Voice Notes**.\n\nFirst, tell me your full name, email, phone (optional), LinkedIn, and any portfolio URL (GitHub / Behance / other – or say “none”).")
 
     def _process_generation(self, state: str, message: dict):
         text_input = self._extract_text_or_voice(message)
@@ -474,18 +671,21 @@ Let's get to work! Upload a PDF as your Master Resume, or type /generate to star
             send_message(self.chat_id, "Got it. Now dictate your Education (University, Degree, Graduation Date).")
         elif state == "GENERATE_EDU":
             self.storage.update(self.chat_id, {"current_state": "GENERATE_EXP", "generate_buffer": buffer})
-            send_message(self.chat_id, "Great. Now list your Work Experience. Tell me the company, role, duration, and what you achieved (I will format it into a continuous STARL narrative).")
+            send_message(self.chat_id, "Great. Now list your Work Experience. Tell me the company, role, duration, and what you achieved.")
         elif state == "GENERATE_EXP":
             self.storage.update(self.chat_id, {"current_state": "GENERATE_SKILLS", "generate_buffer": buffer})
-            send_message(self.chat_id, "Almost done. Dictate your Technical Skills (Languages, Frameworks, Tools).")
+            send_message(self.chat_id, "Almost done. Dictate your Skills (technical, professional, tools, languages – whatever is relevant to your field).")
         elif state == "GENERATE_SKILLS":
+            self.storage.update(self.chat_id, {"current_state": "GENERATE_PROJECTS", "generate_buffer": buffer})
+            send_message(self.chat_id, "Final step – tell me about your key projects, campaigns, case studies, or notable work (title + what you achieved). If you have none, just say “none”.")
+        elif state == "GENERATE_PROJECTS":
             self.storage.update(self.chat_id, {"current_state": "IDLE", "generate_buffer": buffer})
             msg_id = send_message(self.chat_id, "⏳ Compiling and formatting your Master Resume...")
             master = self.gemini.generate_master_from_dictation(buffer)
             self.storage.update(self.chat_id, {"master_resume": master.model_dump()})
             pdf_path = "/tmp/Generated_Master.pdf"
             export_to_pdf(master, pdf_path)
-            send_doc(self.chat_id, pdf_path, "✅ Master Resume Generated and saved to database!")
+            send_doc(self.chat_id, pdf_path, "✅ Master Resume Generated and saved!")
             edit_message(self.chat_id, msg_id, "Done.")
 
     def _extract_text_or_voice(self, message: dict) -> str:
@@ -503,19 +703,19 @@ Let's get to work! Upload a PDF as your Master Resume, or type /generate to star
     # --- Scraping Flow ---
     def _ask_role(self):
         self.storage.update(self.chat_id, {"current_state": "AWAITING_SCRAPE_ROLE"})
-        send_message(self.chat_id, "Target Role? (e.g., Python Developer)")
+        send_message(self.chat_id, "Target Role? (e.g., Python Developer, Marketing Manager, Reservoir Engineer)")
 
     def _process_role(self, text):
         self.storage.update(self.chat_id, {"target_role": text, "current_state": "AWAITING_SCRAPE_LOCATION"})
-        send_message(self.chat_id, "Location? (e.g., Remote, Nigeria)")
+        send_message(self.chat_id, "Location? (e.g., Remote, Nigeria, Lagos)")
 
     async def _process_location(self, text):
         self.storage.update(self.chat_id, {"target_location": text, "current_state": "AWAITING_JOB_LINK"})
-        msg_id = send_message(self.chat_id, "⏳ Deploying multi-platform scrapers (LinkedIn, RemoteOK, etc.)...")
+        msg_id = send_message(self.chat_id, "⏳ Deploying multi-platform scrapers...")
         
         jobs = await self.scraper.fetch_multi_platform_jobs(self.profile["target_role"], text)
         if not jobs:
-            edit_message(self.chat_id, msg_id, "No jobs found.")
+            edit_message(self.chat_id, msg_id, "No jobs found right now.")
             return
 
         edit_message(self.chat_id, msg_id, "⏳ Analyzing targets against your Master Resume...")
@@ -575,20 +775,39 @@ Let's get to work! Upload a PDF as your Master Resume, or type /generate to star
             self._execute_tailoring(self.profile["job_desc"], qa)
 
     def _execute_tailoring(self, job_desc, qa):
-        master = HarvardResume.model_validate(self.profile["master_resume"])
-        gh_projects = [ProjectEntry.model_validate(p) for p in self.profile.get("github_projects", [])]
+        send_message(self.chat_id, "⏳ Looking for the most relevant projects from your portfolio...")
         
+        portfolio_url = self.profile.get("github") or ""
+        gh_projects = []
+        
+        if portfolio_url:
+            # synchronous path for GitHub; async path already handled earlier if needed
+            raw_repos = self.scraper.scrape_portfolio(portfolio_url)
+            if raw_repos:
+                analysis = self.gemini.select_job_specific_github_projects(raw_repos, job_desc)
+                gh_projects = [ProjectEntry(title=p.title, link=p.live_link, achievements=p.achievements) for p in analysis.top_projects]
+        
+        # Fallback to previously stored projects
+        if not gh_projects:
+            gh_projects = [ProjectEntry.model_validate(p) for p in self.profile.get("github_projects", [])]
+        
+        send_message(self.chat_id, "⏳ Formatting tailored PDF...")
+        master = HarvardResume.model_validate(self.profile["master_resume"])
         tailored = self.gemini.tailor_resume(master, job_desc, qa, gh_projects)
         cheat_sheet = self.gemini.generate_cheat_sheet(master, job_desc)
         
         pdf_path = "/tmp/Tailored_Resume.pdf"
         export_to_pdf(tailored, pdf_path)
         
+        # CRITICAL FIX: short caption only → PDF always arrives
+        send_doc(self.chat_id, pdf_path, "📄 Your tailored Harvard-style resume is ready!")
+        
+        # Cheat sheet as a separate message (no length limit issues)
         cheat_msg = f"🎯 **Match Score:** {cheat_sheet.match_score}%\n📈 **Strategy:** {cheat_sheet.why_you_win}\n\n📝 **Application Cheat Sheet:**\n"
         for qa_pair in cheat_sheet.likely_form_questions:
             cheat_msg += f"• *Q: {qa_pair.question}*\n  *A:* {qa_pair.recommended_answer}\n\n"
-            
-        send_doc(self.chat_id, pdf_path, cheat_msg)
+        send_message(self.chat_id, cheat_msg)
+        
         self.storage.update(self.chat_id, {"current_state": "AWAITING_COVER_LETTER_CONFIRM"})
         send_message(self.chat_id, "Do you want a Cover Letter generated? (yes/no)")
 
