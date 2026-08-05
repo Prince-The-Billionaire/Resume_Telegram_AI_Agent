@@ -1031,7 +1031,7 @@ def daily_job_scrape_cron():
                 except Exception as e:
                     logger.error(f"Cron match failed for user {chat_id}: {e}")
 
-@app.function(schedule=modal.Cron("0 12 * * *", timezone="Africa/Lagos"), secrets=[modal.Secret.from_name("resume-agent-secret")], timeout=300)
+@app.function(schedule=modal.Cron("0 9 * * *", timezone="Africa/Lagos"), secrets=[modal.Secret.from_name("resume-agent-secret")], timeout=300)
 def inactivity_reminder_cron():
     """Daily cron task that sends a friendly, non-intrusive reminder to users inactive for 7+ days."""
     storage = StorageService()
