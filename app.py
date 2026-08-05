@@ -3,6 +3,7 @@ import json
 import io
 import logging
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 import modal
 from pydantic import BaseModel
@@ -29,6 +30,15 @@ image = (
 )
 
 app = modal.App("ats-resume-bot", image=image)
+
+# --- Custom Exceptions ---
+class GeminiQuotaException(Exception):
+    """Raised when Gemini API quota or rate limits are exceeded."""
+    pass
+
+class AgentProcessingException(Exception):
+    """Raised for generic agent execution failures."""
+    pass
 
 # --- Pydantic Models ---
 class PersonalInfo(BaseModel):
@@ -193,16 +203,24 @@ class GeminiService:
     def __init__(self):
         from google import genai
         from google.genai import types
-        self.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
         self.types = types
         self.model = "gemini-2.5-flash"
 
     def _structured(self, prompt: str, schema, temp=0.2):
-        resp = self.client.models.generate_content(
-            model=self.model, contents=prompt,
-            config=self.types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=temp)
-        )
-        return schema.model_validate_json(resp.text)
+        try:
+            resp = self.client.models.generate_content(
+                model=self.model, contents=prompt,
+                config=self.types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=temp)
+            )
+            return schema.model_validate_json(resp.text)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg or "api_key" in err_msg:
+                logger.error(f"Gemini API Quota/Key Error: {e}")
+                raise GeminiQuotaException("API quota limit reached or invalid API key.")
+            logger.error(f"Gemini Processing Error: {e}")
+            raise AgentProcessingException(f"Failed to process AI content: {e}")
 
     def parse_master(self, raw_text: str) -> HarvardResume:
         prompt = f"""Parse this raw text resume into the highly structured Harvard schema.
@@ -301,7 +319,8 @@ Resume:\n{master.model_dump_json(exclude_none=True)}\nJob:\n{job_description}"""
         return self._structured(prompt, ApplicationCheatSheet, 0.3)
 
     def cover_letter(self, master: HarvardResume, job_description: str) -> str:
-        prompt = f"""Write a highly tailored, compelling cover letter based on this resume and job description.
+        try:
+            prompt = f"""Write a highly tailored, compelling cover letter based on this resume and job description.
 STRICT REQUIREMENTS:
 - Maximum TWO paragraphs.
 - Maximum 220 words.
@@ -313,16 +332,27 @@ STRICT REQUIREMENTS:
 - Sound like an excellent, confident Staff Software Engineer wrote it. No placeholders.
 
 Resume:\n{master.model_dump_json(exclude_none=True)}\nJob:\n{job_description}"""
-        resp = self.client.models.generate_content(model=self.model, contents=prompt, config=self.types.GenerateContentConfig(temperature=0.3))
-        return resp.text
+            resp = self.client.models.generate_content(model=self.model, contents=prompt, config=self.types.GenerateContentConfig(temperature=0.3))
+            return resp.text
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                raise GeminiQuotaException("API quota limit reached during cover letter generation.")
+            raise AgentProcessingException("Failed to generate cover letter.")
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
-        prompt = "Transcribe this audio exactly as spoken."
-        resp = self.client.models.generate_content(
-            model=self.model,
-            contents=[self.types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"), prompt]
-        )
-        return resp.text
+        try:
+            prompt = "Transcribe this audio exactly as spoken."
+            resp = self.client.models.generate_content(
+                model=self.model,
+                contents=[self.types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"), prompt]
+            )
+            return resp.text
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                raise GeminiQuotaException("API quota limit reached during voice transcription.")
+            raise AgentProcessingException("Failed to transcribe audio.")
 
 class StorageService:
     def __init__(self):
@@ -330,20 +360,31 @@ class StorageService:
         self.client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
     def get_or_create_profile(self, chat_id: int) -> dict:
+        now_str = datetime.now(timezone.utc).isoformat()
         res = self.client.table("profiles").select("*").eq("chat_id", chat_id).execute()
-        if res.data: return res.data[0]
+        if res.data:
+            # Update activity timestamp
+            self.client.table("profiles").update({"last_active_at": now_str}).eq("chat_id", chat_id).execute()
+            return res.data[0]
         
         new_profile = {
             "chat_id": chat_id, "master_resume": {}, "current_state": "IDLE",
             "job_desc": "", "questions": [], "current_q_idx": 0, "qa_responses": "",
             "target_role": "", "target_location": "", "cron_enabled": True, "generate_buffer": "",
-            "linkedin": "", "github": "", "github_projects": []
+            "linkedin": "", "github": "", "github_projects": [], "last_active_at": now_str,
+            "last_reminder_sent_at": None
         }
         self.client.table("profiles").insert(new_profile).execute()
         return new_profile
 
     def update(self, chat_id: int, updates: dict):
+        updates["last_active_at"] = datetime.now(timezone.utc).isoformat()
         self.client.table("profiles").update(updates).eq("chat_id", chat_id).execute()
+
+    def get_inactive_users(self, days_inactive: int = 7) -> List[dict]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_inactive)).isoformat()
+        res = self.client.table("profiles").select("*").lt("last_active_at", cutoff).execute()
+        return res.data or []
 
 class ScraperService:
     def scrape_github_repos(self, github_url: str) -> List[dict]:
@@ -362,8 +403,8 @@ class ScraperService:
                             "language": r.get("language"),
                             "url": r.get("html_url")
                         })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"GitHub scrape error: {e}")
         return repos_data
 
     async def scrape_behance_projects(self, behance_url: str) -> List[dict]:
@@ -409,7 +450,6 @@ class ScraperService:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
-                
                 try:
                     url = f"https://www.linkedin.com/jobs/search/?keywords={role.replace(' ', '%20')}&location={location.replace(' ', '%20')}"
                     await page.goto(url, timeout=15000)
@@ -419,9 +459,8 @@ class ScraperService:
                         company = await (await card.query_selector(".base-search-card__subtitle")).inner_text()
                         link = await (await card.query_selector("a.base-card__full-link")).get_attribute("href")
                         results.append({"title": title.strip(), "company": company.strip(), "platform": "LinkedIn", "link": link.split('?')[0]})
-                except Exception:
-                    pass
-                
+                except Exception as e:
+                    logger.error(f"LinkedIn scraping page issue: {e}")
                 await browser.close()
         except Exception as e:
             logger.error(f"Scraper error: {e}")
@@ -437,7 +476,8 @@ class ScraperService:
                 text = await page.inner_text("body")
                 await browser.close()
                 return ' '.join(text.split())[:4000]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Failed to extract JD from URL {url}: {e}")
             return f"Context extraction failed for: {url}"
 
 # --- Telegram Helpers ---
@@ -588,34 +628,57 @@ class BotController:
         self.storage.update(self.chat_id, {"master_resume": resume.model_dump(exclude_none=True)})
         self._refresh_profile()
 
+    def _handle_error(self, e: Exception, user_friendly_context: str = "processing your request"):
+        """Centralized error management to reflect failures directly to the user."""
+        logger.error(f"Error during {user_friendly_context}: {e}", exc_info=True)
+        
+        if isinstance(e, GeminiQuotaException):
+            send_message(
+                self.chat_id, 
+                "⚠️ **Service Capacity Notice**\n\n"
+                "Our AI system has reached its current processing quota/limit. "
+                "We are actively working on refreshing capacity! Please try again in a little while."
+            )
+        else:
+            send_message(
+                self.chat_id,
+                f"⚠️ **Error Occurred**\n\n"
+                f"Sorry, something went wrong while {user_friendly_context}.\n"
+                f"Details: `{str(e)[:200]}`\n\n"
+                f"Please try again or tap /start to restart the process."
+            )
+
     async def handle_async(self, message: dict):
-        text = message.get("text", "").strip() if "text" in message else ""
-        self._refresh_profile()
-        state = self.profile.get("current_state", "IDLE")
+        try:
+            text = message.get("text", "").strip() if "text" in message else ""
+            self._refresh_profile()
+            state = self.profile.get("current_state", "IDLE")
 
-        if text == "/start": return self._start()
-        if text == "/stop": return self._stop_cron()
-        if text == "/generate": return self._start_generate()
-        if text in ["/scrape", "/newscrape"]: return self._ask_role()
-        if text == "/tailor": return self._ask_tailor()
-        if text == "/changeresume": return self._change_resume()
-        if text == "/github": return self._trigger_github_sync()
-        if text == "/atsanalysis": return self._run_ats_analysis()
-        if text == "/fixissues": return self._run_fix_issues()
+            if text == "/start": return self._start()
+            if text == "/stop": return self._stop_cron()
+            if text == "/generate": return self._start_generate()
+            if text in ["/scrape", "/newscrape"]: return self._ask_role()
+            if text == "/tailor": return self._ask_tailor()
+            if text == "/changeresume": return self._change_resume()
+            if text == "/github": return self._trigger_github_sync()
+            if text == "/atsanalysis": return self._run_ats_analysis()
+            if text == "/fixissues": return self._run_fix_issues()
 
-        if state.startswith("GENERATE_"): return self._process_generation(state, message)
-        if state == "AWAITING_MASTER": return self._process_master(message)
-        if state == "AWAITING_LINKEDIN": return self._process_linkedin(text)
-        if state == "AWAITING_GITHUB": return self._process_github_initial(text)
-        if state == "AWAITING_GITHUB_SYNC": return self._process_github_sync(text)
-        if state == "AWAITING_SCRAPE_ROLE": return self._process_role(text)
-        if state == "AWAITING_SCRAPE_LOCATION": return await self._process_location(text)
-        if state == "AWAITING_JOB_LINK": return await self._process_job_link(text)
-        if state == "AWAITING_JOB_DESCRIPTION": return self._process_direct_job(text)
-        if state == "INTERVIEW_MODE": return self._process_interview(message)
-        if state == "AWAITING_COVER_LETTER_CONFIRM": return self._process_cover_letter(text)
+            if state.startswith("GENERATE_"): return self._process_generation(state, message)
+            if state == "AWAITING_MASTER": return self._process_master(message)
+            if state == "AWAITING_LINKEDIN": return self._process_linkedin(text)
+            if state == "AWAITING_GITHUB": return self._process_github_initial(text)
+            if state == "AWAITING_GITHUB_SYNC": return self._process_github_sync(text)
+            if state == "AWAITING_SCRAPE_ROLE": return self._process_role(text)
+            if state == "AWAITING_SCRAPE_LOCATION": return await self._process_location(text)
+            if state == "AWAITING_JOB_LINK": return await self._process_job_link(text)
+            if state == "AWAITING_JOB_DESCRIPTION": return self._process_direct_job(text)
+            if state == "INTERVIEW_MODE": return self._process_interview(message)
+            if state == "AWAITING_COVER_LETTER_CONFIRM": return self._process_cover_letter(text)
 
-        send_message(self.chat_id, "Command recognized. Tap the 'Menu' button or type /start to see available options.")
+            send_message(self.chat_id, "Command recognized. Tap the 'Menu' button or type /start to see available options.")
+        except Exception as e:
+            self._handle_error(e, "processing your command")
 
     def _start(self):
         set_bot_commands()
@@ -656,10 +719,9 @@ Tap the **Menu button** or use:
             self.storage.update(self.chat_id, {"current_state": "AWAITING_LINKEDIN"})
             send_message(self.chat_id, "Parsed. Now send your LinkedIn URL:")
         except Exception as e:
-            logger.error(f"Parse error: {e}")
             if old_master:
                 self.storage.update(self.chat_id, {"master_resume": old_master})
-            send_message(self.chat_id, "⚠️ Parsing failed. Previous resume preserved. Please ensure the PDF is text-readable.")
+            self._handle_error(e, "parsing your uploaded PDF resume")
 
     def _process_linkedin(self, text):
         self.storage.update(self.chat_id, {"linkedin": text, "current_state": "AWAITING_GITHUB"})
@@ -686,56 +748,62 @@ Tap the **Menu button** or use:
 
     async def _execute_portfolio_scan(self, portfolio_url: str):
         msg_id = send_message(self.chat_id, "⏳ Deep-scanning your portfolio for projects...")
-        raw_items = await self.scraper.scrape_portfolio_async(portfolio_url)
-        if raw_items:
-            analysis = self.gemini.select_top_github_projects(raw_items)
-            projects_data = [ProjectEntry(title=p.title, link=p.live_link or p.description, achievements=p.achievements) for p in analysis.top_projects]
-            self.storage.update(self.chat_id, {"github_projects": [p.model_dump() for p in projects_data]})
-            
-            master = self._get_master_resume()
-            if master:
-                master.key_projects = projects_data
-                master.personal_info.github = portfolio_url
-                self._save_master_resume(master)
-                pdf_path = "/tmp/Updated_Master.pdf"
-                export_to_pdf(master, pdf_path)
-                edit_message(self.chat_id, msg_id, "✅ Portfolio synced! Generating your updated Master Resume...")
-                send_doc(self.chat_id, pdf_path, "📄 Updated Master Resume.")
+        try:
+            raw_items = await self.scraper.scrape_portfolio_async(portfolio_url)
+            if raw_items:
+                analysis = self.gemini.select_top_github_projects(raw_items)
+                projects_data = [ProjectEntry(title=p.title, link=p.live_link or p.description, achievements=p.achievements) for p in analysis.top_projects]
+                self.storage.update(self.chat_id, {"github_projects": [p.model_dump() for p in projects_data]})
+                
+                master = self._get_master_resume()
+                if master:
+                    master.key_projects = projects_data
+                    master.personal_info.github = portfolio_url
+                    self._save_master_resume(master)
+                    pdf_path = "/tmp/Updated_Master.pdf"
+                    export_to_pdf(master, pdf_path)
+                    edit_message(self.chat_id, msg_id, "✅ Portfolio synced! Generating your updated Master Resume...")
+                    send_doc(self.chat_id, pdf_path, "📄 Updated Master Resume.")
+                else:
+                    edit_message(self.chat_id, msg_id, "✅ Portfolio synced! Projects staged for your next application.")
             else:
-                edit_message(self.chat_id, msg_id, "✅ Portfolio synced! Projects staged for your next application.")
-        else:
-            edit_message(self.chat_id, msg_id, "⚠️ No public projects found.")
+                edit_message(self.chat_id, msg_id, "⚠️ No public projects found.")
+        except Exception as e:
+            self._handle_error(e, "scanning your portfolio")
 
     def _start_generate(self):
         self.storage.update(self.chat_id, {"current_state": "GENERATE_PERSONAL", "generate_buffer": ""})
         send_message(self.chat_id, "Let's build your Master Resume. You can type or send **Voice Notes**.\n\nFirst, tell me your full name, email, phone (optional), LinkedIn, and portfolio URL (or “none”).")
 
     def _process_generation(self, state: str, message: dict):
-        text_input = self._extract_text_or_voice(message)
-        if not text_input: return
-        buffer = self.profile.get("generate_buffer", "") + f"\n[{state}]: {text_input}"
-        
-        if state == "GENERATE_PERSONAL":
-            self.storage.update(self.chat_id, {"current_state": "GENERATE_EDU", "generate_buffer": buffer})
-            send_message(self.chat_id, "Got it. Dictate your Education (University, Degree, Graduation Date).")
-        elif state == "GENERATE_EDU":
-            self.storage.update(self.chat_id, {"current_state": "GENERATE_EXP", "generate_buffer": buffer})
-            send_message(self.chat_id, "Now list Work Experience (company, role, duration, achievements).")
-        elif state == "GENERATE_EXP":
-            self.storage.update(self.chat_id, {"current_state": "GENERATE_SKILLS", "generate_buffer": buffer})
-            send_message(self.chat_id, "Dictate Skills (technical, professional, tools).")
-        elif state == "GENERATE_SKILLS":
-            self.storage.update(self.chat_id, {"current_state": "GENERATE_PROJECTS", "generate_buffer": buffer})
-            send_message(self.chat_id, "Tell me about key projects, campaigns, or volunteering. If none, say “none”.")
-        elif state == "GENERATE_PROJECTS":
-            self.storage.update(self.chat_id, {"current_state": "IDLE", "generate_buffer": buffer})
-            msg_id = send_message(self.chat_id, "⏳ Compiling Master Resume...")
-            master = self.gemini.generate_master_from_dictation(buffer)
-            self._save_master_resume(master)
-            pdf_path = "/tmp/Generated_Master.pdf"
-            export_to_pdf(master, pdf_path)
-            send_doc(self.chat_id, pdf_path, "✅ Master Resume Generated!")
-            edit_message(self.chat_id, msg_id, "Done.")
+        try:
+            text_input = self._extract_text_or_voice(message)
+            if not text_input: return
+            buffer = self.profile.get("generate_buffer", "") + f"\n[{state}]: {text_input}"
+            
+            if state == "GENERATE_PERSONAL":
+                self.storage.update(self.chat_id, {"current_state": "GENERATE_EDU", "generate_buffer": buffer})
+                send_message(self.chat_id, "Got it. Dictate your Education (University, Degree, Graduation Date).")
+            elif state == "GENERATE_EDU":
+                self.storage.update(self.chat_id, {"current_state": "GENERATE_EXP", "generate_buffer": buffer})
+                send_message(self.chat_id, "Now list Work Experience (company, role, duration, achievements).")
+            elif state == "GENERATE_EXP":
+                self.storage.update(self.chat_id, {"current_state": "GENERATE_SKILLS", "generate_buffer": buffer})
+                send_message(self.chat_id, "Dictate Skills (technical, professional, tools).")
+            elif state == "GENERATE_SKILLS":
+                self.storage.update(self.chat_id, {"current_state": "GENERATE_PROJECTS", "generate_buffer": buffer})
+                send_message(self.chat_id, "Tell me about key projects, campaigns, or volunteering. If none, say “none”.")
+            elif state == "GENERATE_PROJECTS":
+                self.storage.update(self.chat_id, {"current_state": "IDLE", "generate_buffer": buffer})
+                msg_id = send_message(self.chat_id, "⏳ Compiling Master Resume...")
+                master = self.gemini.generate_master_from_dictation(buffer)
+                self._save_master_resume(master)
+                pdf_path = "/tmp/Generated_Master.pdf"
+                export_to_pdf(master, pdf_path)
+                send_doc(self.chat_id, pdf_path, "✅ Master Resume Generated!")
+                edit_message(self.chat_id, msg_id, "Done.")
+        except Exception as e:
+            self._handle_error(e, "generating your Master Resume")
 
     def _extract_text_or_voice(self, message: dict) -> str:
         if "voice" in message:
@@ -744,8 +812,8 @@ Tap the **Menu button** or use:
                 text = self.gemini.transcribe_audio(audio_bytes)
                 send_message(self.chat_id, f"📝 *Transcript:* {text}")
                 return text
-            except Exception:
-                send_message(self.chat_id, "Voice transcription failed. Please type.")
+            except Exception as e:
+                self._handle_error(e, "transcribing voice note")
                 return None
         return message.get("text", "")
 
@@ -765,7 +833,8 @@ Tap the **Menu button** or use:
             msg += "*Run /fixissues to let me automatically rewrite your resume based on these suggestions.*"
             edit_message(self.chat_id, msg_id, msg)
         except Exception as e:
-            edit_message(self.chat_id, msg_id, f"⚠️ Analysis failed: {e}")
+            edit_message(self.chat_id, msg_id, "⚠️ Analysis failed.")
+            self._handle_error(e, "performing ATS analysis")
 
     def _run_fix_issues(self):
         master = self._get_master_resume()
@@ -780,7 +849,8 @@ Tap the **Menu button** or use:
             edit_message(self.chat_id, msg_id, "✅ Your resume has been optimized!")
             send_doc(self.chat_id, pdf_path, "📄 ATS-Optimized Master Resume")
         except Exception as e:
-            edit_message(self.chat_id, msg_id, f"⚠️ Fix failed: {e}")
+            edit_message(self.chat_id, msg_id, "⚠️ Optimization failed.")
+            self._handle_error(e, "optimizing your resume")
 
     def _ask_role(self):
         self.storage.update(self.chat_id, {"current_state": "AWAITING_SCRAPE_ROLE"})
@@ -793,20 +863,23 @@ Tap the **Menu button** or use:
     async def _process_location(self, text):
         self.storage.update(self.chat_id, {"target_location": text, "current_state": "AWAITING_JOB_LINK"})
         msg_id = send_message(self.chat_id, "⏳ Deploying multi-platform scrapers...")
-        jobs = await self.scraper.fetch_multi_platform_jobs(self.profile["target_role"], text)
-        if not jobs:
-            edit_message(self.chat_id, msg_id, "No jobs found right now.")
-            return
-        edit_message(self.chat_id, msg_id, "⏳ Analyzing targets against your Master Resume...")
-        master = self._get_master_resume()
-        if not master: return
-        ranked = self.gemini.rank_jobs(master, jobs)
-        
-        msg = f"✅ **Top {len(ranked.top_matches)} Curated Matches:**\n\n"
-        for job in ranked.top_matches:
-            msg += f"🎯 *{job.title}* at {job.company} ({job.platform})\n🧠 *Why fit:* {job.why_fit}\n🔗 [Link]({job.link})\n\n"
-        msg += "*Reply with a specific job link to trigger the Tailor process.*"
-        edit_message(self.chat_id, msg_id, msg)
+        try:
+            jobs = await self.scraper.fetch_multi_platform_jobs(self.profile["target_role"], text)
+            if not jobs:
+                edit_message(self.chat_id, msg_id, "No jobs found right now.")
+                return
+            edit_message(self.chat_id, msg_id, "⏳ Analyzing targets against your Master Resume...")
+            master = self._get_master_resume()
+            if not master: return
+            ranked = self.gemini.rank_jobs(master, jobs)
+            
+            msg = f"✅ **Top {len(ranked.top_matches)} Curated Matches:**\n\n"
+            for job in ranked.top_matches:
+                msg += f"🎯 *{job.title}* at {job.company} ({job.platform})\n🧠 *Why fit:* {job.why_fit}\n🔗 [Link]({job.link})\n\n"
+            msg += "*Reply with a specific job link to trigger the Tailor process.*"
+            edit_message(self.chat_id, msg_id, msg)
+        except Exception as e:
+            self._handle_error(e, "scraping or ranking job boards")
 
     def _ask_tailor(self):
         self.storage.update(self.chat_id, {"current_state": "AWAITING_JOB_DESCRIPTION"})
@@ -815,10 +888,13 @@ Tap the **Menu button** or use:
     async def _process_job_link(self, text):
         if not text.startswith("http"): return
         msg_id = send_message(self.chat_id, "⏳ Extracting job requirements...")
-        job_desc = await self.scraper.extract_job_description_async(text)
-        self.storage.update(self.chat_id, {"job_desc": job_desc})
-        edit_message(self.chat_id, msg_id, "✅ Evaluating gaps based on your history...")
-        self._evaluate_and_route(job_desc)
+        try:
+            job_desc = await self.scraper.extract_job_description_async(text)
+            self.storage.update(self.chat_id, {"job_desc": job_desc})
+            edit_message(self.chat_id, msg_id, "✅ Evaluating gaps based on your history...")
+            self._evaluate_and_route(job_desc)
+        except Exception as e:
+            self._handle_error(e, "extracting job description link")
 
     def _process_direct_job(self, text):
         self.storage.update(self.chat_id, {"job_desc": text})
@@ -826,82 +902,95 @@ Tap the **Menu button** or use:
         self._evaluate_and_route(text)
 
     def _evaluate_and_route(self, job_desc):
-        master = self._get_master_resume()
-        if not master: return
-        gap = self.gemini.gap_interview(master, job_desc)
-        if gap.needs_interview and gap.questions:
-            self.storage.update(self.chat_id, {"current_state": "INTERVIEW_MODE", "questions": gap.questions, "current_q_idx": 0, "qa_responses": ""})
-            send_message(self.chat_id, f"To tailor perfectly via STARL, I need context:\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
-        else:
-            self._execute_tailoring(job_desc, "No additions needed.")
+        try:
+            master = self._get_master_resume()
+            if not master: return
+            gap = self.gemini.gap_interview(master, job_desc)
+            if gap.needs_interview and gap.questions:
+                self.storage.update(self.chat_id, {"current_state": "INTERVIEW_MODE", "questions": gap.questions, "current_q_idx": 0, "qa_responses": ""})
+                send_message(self.chat_id, f"To tailor perfectly via STARL, I need context:\n\n*Q 1/{len(gap.questions)}*: {gap.questions[0]}")
+            else:
+                self._execute_tailoring(job_desc, "No additions needed.")
+        except Exception as e:
+            self._handle_error(e, "evaluating job description gaps")
 
     def _process_interview(self, message: dict):
-        answer = self._extract_text_or_voice(message)
-        if not answer: return
-        idx, questions = self.profile["current_q_idx"], self.profile["questions"]
-        qa = self.profile.get("qa_responses", "") + f"Q: {questions[idx]}\nA: {answer}\n\n"
-        if idx + 1 < len(questions):
-            self.storage.update(self.chat_id, {"current_q_idx": idx + 1, "qa_responses": qa})
-            send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}")
-        else:
-            send_message(self.chat_id, "Restructuring experience into STARL narrative...")
-            self._execute_tailoring(self.profile["job_desc"], qa)
+        try:
+            answer = self._extract_text_or_voice(message)
+            if not answer: return
+            idx, questions = self.profile["current_q_idx"], self.profile["questions"]
+            qa = self.profile.get("qa_responses", "") + f"Q: {questions[idx]}\nA: {answer}\n\n"
+            if idx + 1 < len(questions):
+                self.storage.update(self.chat_id, {"current_q_idx": idx + 1, "qa_responses": qa})
+                send_message(self.chat_id, f"*Q {idx+2}/{len(questions)}*: {questions[idx+1]}")
+            else:
+                send_message(self.chat_id, "Restructuring experience into STARL narrative...")
+                self._execute_tailoring(self.profile["job_desc"], qa)
+        except Exception as e:
+            self._handle_error(e, "processing interview response")
 
     def _execute_tailoring(self, job_desc, qa):
-        send_message(self.chat_id, "⏳ Finding relevant projects...")
-        portfolio_url = self.profile.get("github") or ""
-        gh_projects = []
-        if portfolio_url:
-            raw_repos = self.scraper.scrape_portfolio(portfolio_url)
-            if raw_repos:
-                analysis = self.gemini.select_job_specific_github_projects(raw_repos, job_desc)
-                gh_projects = [ProjectEntry(title=p.title, link=p.live_link, achievements=p.achievements) for p in analysis.top_projects]
-        if not gh_projects:
-            gh_projects = [ProjectEntry.model_validate(p) for p in self.profile.get("github_projects", [])]
-        
-        send_message(self.chat_id, "⏳ Formatting tailored PDF...")
-        master = self._get_master_resume()
-        if not master: return
-        tailored = self.gemini.tailor_resume(master, job_desc, qa, gh_projects)
-        
-        pdf_path = "/tmp/Tailored_Resume.pdf"
-        export_to_pdf(tailored, pdf_path)
-        send_doc(self.chat_id, pdf_path, "📄 Your tailored Harvard-style resume is ready!")
-
-        send_message(self.chat_id, "⏳ Calculating Application Readiness Score...")
-        readiness = self.gemini.score_readiness(tailored, job_desc)
-        
-        def bar(score):
-            f = min(max(int(score / 10), 0), 10)
-            return "🟩" * f + "⬜" * (10 - f)
+        try:
+            send_message(self.chat_id, "⏳ Finding relevant projects...")
+            portfolio_url = self.profile.get("github") or ""
+            gh_projects = []
+            if portfolio_url:
+                raw_repos = self.scraper.scrape_portfolio(portfolio_url)
+                if raw_repos:
+                    analysis = self.gemini.select_job_specific_github_projects(raw_repos, job_desc)
+                    gh_projects = [ProjectEntry(title=p.title, link=p.live_link, achievements=p.achievements) for p in analysis.top_projects]
+            if not gh_projects:
+                gh_projects = [ProjectEntry.model_validate(p) for p in self.profile.get("github_projects", [])]
             
-        r_msg = f"🏆 **Application Ready:** {readiness.application_ready_score}%\n\n"
-        r_msg += f"🤖 ATS Score: {bar(readiness.ats_score)} {readiness.ats_score}%\n"
-        r_msg += f"🔑 Keywords:  {bar(readiness.keyword_match)} {readiness.keyword_match}%\n"
-        r_msg += f"💼 Experience:{bar(readiness.experience_match)} {readiness.experience_match}%\n"
-        r_msg += f"🚀 Projects:  {bar(readiness.projects_match)} {readiness.projects_match}%\n"
-        r_msg += f"📑 Formatting:{bar(readiness.formatting_score)} {readiness.formatting_score}%\n\n"
-        r_msg += f"💡 **Recommendation:** {readiness.recommendation}"
-        send_message(self.chat_id, r_msg)
+            send_message(self.chat_id, "⏳ Formatting tailored PDF...")
+            master = self._get_master_resume()
+            if not master: return
+            tailored = self.gemini.tailor_resume(master, job_desc, qa, gh_projects)
+            
+            pdf_path = "/tmp/Tailored_Resume.pdf"
+            export_to_pdf(tailored, pdf_path)
+            send_doc(self.chat_id, pdf_path, "📄 Your tailored Harvard-style resume is ready!")
 
-        cheat_sheet = self.gemini.generate_cheat_sheet(master, job_desc)
-        cheat_msg = f"🎯 **Match Score:** {cheat_sheet.match_score}%\n📈 **Strategy:** {cheat_sheet.why_you_win}\n\n📝 **Application Cheat Sheet:**\n"
-        for qa_pair in cheat_sheet.likely_form_questions:
-            cheat_msg += f"• *Q: {qa_pair.question}*\n  *A:* {qa_pair.recommended_answer}\n\n"
-        send_message(self.chat_id, cheat_msg)
-        
-        self.storage.update(self.chat_id, {"current_state": "AWAITING_COVER_LETTER_CONFIRM"})
-        send_message(self.chat_id, "Do you want a Cover Letter generated? (yes/no)")
+            send_message(self.chat_id, "⏳ Calculating Application Readiness Score...")
+            readiness = self.gemini.score_readiness(tailored, job_desc)
+            
+            def bar(score):
+                f = min(max(int(score / 10), 0), 10)
+                return "🟩" * f + "⬜" * (10 - f)
+                
+            r_msg = f"🏆 **Application Ready:** {readiness.application_ready_score}%\n\n"
+            r_msg += f"🤖 ATS Score: {bar(readiness.ats_score)} {readiness.ats_score}%\n"
+            r_msg += f"🔑 Keywords:  {bar(readiness.keyword_match)} {readiness.keyword_match}%\n"
+            r_msg += f"💼 Experience:{bar(readiness.experience_match)} {readiness.experience_match}%\n"
+            r_msg += f"🚀 Projects:  {bar(readiness.projects_match)} {readiness.projects_match}%\n"
+            r_msg += f"📑 Formatting:{bar(readiness.formatting_score)} {readiness.formatting_score}%\n\n"
+            r_msg += f"💡 **Recommendation:** {readiness.recommendation}"
+            send_message(self.chat_id, r_msg)
+
+            cheat_sheet = self.gemini.generate_cheat_sheet(master, job_desc)
+            cheat_msg = f"🎯 **Match Score:** {cheat_sheet.match_score}%\n📈 **Strategy:** {cheat_sheet.why_you_win}\n\n📝 **Application Cheat Sheet:**\n"
+            for qa_pair in cheat_sheet.likely_form_questions:
+                cheat_msg += f"• *Q: {qa_pair.question}*\n  *A:* {qa_pair.recommended_answer}\n\n"
+            send_message(self.chat_id, cheat_msg)
+            
+            self.storage.update(self.chat_id, {"current_state": "AWAITING_COVER_LETTER_CONFIRM"})
+            send_message(self.chat_id, "Do you want a Cover Letter generated? (yes/no)")
+        except Exception as e:
+            self._handle_error(e, "tailoring your resume")
 
     def _process_cover_letter(self, text):
-        if text.lower() in ["y", "yes"]:
-            master = self._get_master_resume()
-            if master:
-                letter = self.gemini.cover_letter(master, self.profile["job_desc"])
-                send_message(self.chat_id, f"📝 *Cover Letter*\n\n{letter}")
-        else: send_message(self.chat_id, "Skipped.")
-        self.storage.update(self.chat_id, {"current_state": "IDLE"})
+        try:
+            if text.lower() in ["y", "yes"]:
+                master = self._get_master_resume()
+                if master:
+                    letter = self.gemini.cover_letter(master, self.profile["job_desc"])
+                    send_message(self.chat_id, f"📝 *Cover Letter*\n\n{letter}")
+            else: send_message(self.chat_id, "Skipped.")
+            self.storage.update(self.chat_id, {"current_state": "IDLE"})
+        except Exception as e:
+            self._handle_error(e, "generating your cover letter")
 
+# --- Modal Handlers ---
 @app.function(secrets=[modal.Secret.from_name("resume-agent-secret")], timeout=300)
 def process_update_in_background(request_data: dict):
     msg = request_data.get("message")
@@ -940,4 +1029,40 @@ def daily_job_scrape_cron():
                     send_message(chat_id, msg)
                     supabase.table("profiles").update({"current_state": "AWAITING_JOB_LINK"}).eq("chat_id", chat_id).execute()
                 except Exception as e:
-                    logger.error(f"Cron match failed: {e}")
+                    logger.error(f"Cron match failed for user {chat_id}: {e}")
+
+@app.function(schedule=modal.Cron("0 12 * * *", timezone="Africa/Lagos"), secrets=[modal.Secret.from_name("resume-agent-secret")], timeout=300)
+def inactivity_reminder_cron():
+    """Daily cron task that sends a friendly, non-intrusive reminder to users inactive for 7+ days."""
+    storage = StorageService()
+    try:
+        inactive_users = storage.get_inactive_users(days_inactive=7)
+        now_str = datetime.now(timezone.utc).isoformat()
+        
+        for user in inactive_users:
+            chat_id = user.get("chat_id")
+            last_reminder = user.get("last_reminder_sent_at")
+            
+            # Avoid pestering: Send reminder only if we haven't reminded them in the past 7 days
+            if last_reminder:
+                last_reminder_dt = datetime.fromisoformat(last_reminder)
+                if (datetime.now(timezone.utc) - last_reminder_dt).days < 7:
+                    continue
+
+            reminder_msg = (
+                "👋 **Hey there!**\n\n"
+                "Just a quick reminder: You can generate or tailor a brand-new, Harvard-standard ATS resume "
+                "in under 2 minutes!\n\n"
+                "🎙️ Type or voice record with /generate\n"
+                "✂️ Tailor for a specific job post with /tailor\n\n"
+                "Whenever you're ready for your next application, I'm here to help!"
+            )
+            
+            try:
+                send_message(chat_id, reminder_msg)
+                storage.update(chat_id, {"last_reminder_sent_at": now_str})
+                logger.info(f"Inactivity reminder sent to user {chat_id}")
+            except Exception as e:
+                logger.error(f"Failed to send reminder to user {chat_id}: {e}")
+    except Exception as e:
+        logger.error(f"Inactivity reminder cron failed: {e}")
